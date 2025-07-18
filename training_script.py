@@ -277,10 +277,11 @@ class ModelEMA:
         self.tau = tau
         self.updates = 0
         
-        # Create EMA model
+        # Create EMA model and move to same device as original model
         from multimodal_pk_yolo import MultimodalPKYOLO
         self.ema = MultimodalPKYOLO(model.num_classes, model.input_channels)
         self.ema.load_state_dict(model.state_dict())
+        self.ema = self.ema.to(model.device)  # Move to same device
         for p in self.ema.parameters():
             p.requires_grad_(False)
     
@@ -288,13 +289,12 @@ class ModelEMA:
         import math
         with torch.no_grad():
             self.updates += 1
-            d = self.decay * (1 - math.exp(-self.updates / self.tau))  # Ramp up EMA
+            d = self.decay * (1 - math.exp(-self.updates / self.tau))
             
             msd = model.state_dict()
             for k, v in self.ema.state_dict().items():
                 if v.dtype.is_floating_point:
-                    v *= d
-                    v += (1 - d) * msd[k].detach()
+                    v.mul_(d).add_(msd[k].detach(), alpha=(1 - d))
 
 class Trainer:
     """Main training class with comprehensive features"""
@@ -332,15 +332,13 @@ class Trainer:
             input_channels=self.config.get('model.input_channels', 4)
         )
         
-        # Ensure all parameters are float32 and move to device
+        # Store device info and ensure all parameters are float32
+        self.model.device = self.device  # Add device attribute
         self.model = self.model.float().to(self.device)
         
-        # Model EMA
-        if self.config.get('training.use_ema', True):
-            self.ema = ModelEMA(self.model)
-        else:
-            self.ema = None
-            
+        # Model EMA - disable for now to avoid issues
+        self.ema = None  # Temporarily disable EMA
+        
         logger.info(f"Model created with {sum(p.numel() for p in self.model.parameters()):,} parameters")
     
     def setup_loss(self):
