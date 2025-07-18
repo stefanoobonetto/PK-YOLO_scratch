@@ -1,3 +1,8 @@
+"""
+Complete Multimodal PK-YOLO Loss Implementation
+Adapted from PK-YOLO for 4-Channel BraTS2020 Dataset
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -87,7 +92,10 @@ class FocalLoss(nn.Module):
 
 
 class YOLOLoss(nn.Module):
-    
+    """
+    Complete YOLO Loss Function for Multimodal Brain Tumor Detection
+    Adapted from PK-YOLO for 4-channel BraTS2020 dataset
+    """
     
     def __init__(self, model, num_classes=1, anchors=None, autobalance=False):
         super().__init__()
@@ -152,8 +160,39 @@ class YOLOLoss(nn.Module):
         """
         device = targets.device
         
+        # Prepare targets in the expected format
+        if isinstance(targets, dict):
+            # Convert from dataloader format to YOLO format
+            batch_size = targets['images'].shape[0]
+            target_list = []
+            
+            for i in range(batch_size):
+                bboxes = targets['bboxes'][i]  # [num_boxes, 4] in format [x, y, w, h]
+                labels = targets['labels'][i]  # [num_boxes]
+                
+                # Filter out empty boxes (all zeros)
+                valid_mask = (bboxes.sum(dim=1) > 0)
+                bboxes = bboxes[valid_mask]
+                labels = labels[valid_mask]
+                
+                if len(bboxes) > 0:
+                    # Create image index column
+                    img_idx = torch.full((len(bboxes), 1), i, dtype=torch.float32, device=self.device)
+                    
+                    # Combine: [img_idx, class, x, y, w, h]
+                    targets_i = torch.cat([
+                        img_idx,
+                        labels.float().unsqueeze(1),
+                        bboxes
+                    ], dim=1)
+                    target_list.append(targets_i)
+            
+            if target_list:
+                targets = torch.cat(target_list, dim=0)
+            else:
+                targets = torch.zeros((0, 6), device=self.device)
+        
         # Convert predictions to proper format
-        # predictions should be list of (cls_score, bbox_pred, objectness) for each scale
         p = []
         for i, (cls_score, bbox_pred, objectness) in enumerate(predictions):
             # Reshape and concatenate to get [batch, anchors, grid_h, grid_w, predictions]
