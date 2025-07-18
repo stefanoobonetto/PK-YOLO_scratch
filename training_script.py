@@ -1,6 +1,6 @@
 """
-Complete Training Script for Multimodal PK-YOLO
-Integrates all components for end-to-end training
+Fixed Complete Training Script for Multimodal PK-YOLO
+Corrected for proper BraTS 2020 dataset structure and training
 """
 
 import torch
@@ -30,10 +30,6 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
     print("Warning: wandb not available. Install with: pip install wandb")
-
-# Import our modules
-from multimodal_pk_yolo import MultimodalPKYOLO, BraTSDataset, collate_fn
-from complete_yolo_loss import YOLOLoss
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -70,33 +66,6 @@ class EarlyStopping:
     def save_checkpoint(self, model):
         self.best_weights = model.state_dict().copy()
 
-class ModelEMA:
-    """Exponential Moving Average for model weights"""
-    
-    def __init__(self, model, decay=0.9999, tau=2000):
-        self.model = model
-        self.decay = decay
-        self.tau = tau
-        self.updates = 0
-        
-        # Create EMA model and move to same device as original model
-        self.ema = MultimodalPKYOLO(model.num_classes, model.input_channels)
-        self.ema.load_state_dict(model.state_dict())
-        self.ema = self.ema.to(next(model.parameters()).device)  # Move to same device
-        for p in self.ema.parameters():
-            p.requires_grad_(False)
-    
-    def update(self, model):
-        import math
-        with torch.no_grad():
-            self.updates += 1
-            d = self.decay * (1 - math.exp(-self.updates / self.tau))
-            
-            msd = model.state_dict()
-            for k, v in self.ema.state_dict().items():
-                if v.dtype.is_floating_point:
-                    v.mul_(d).add_(msd[k].detach(), alpha=(1 - d))
-
 class Trainer:    
     def __init__(self, config):
         self.config = config
@@ -123,6 +92,9 @@ class Trainer:
         self.setup_utilities()
         
     def setup_model(self):
+        # Import the fixed model
+        from multimodal_pk_yolo import MultimodalPKYOLO
+        
         self.model = MultimodalPKYOLO(
             num_classes=self.config.get('model.num_classes', 1),
             input_channels=self.config.get('model.input_channels', 4)
@@ -130,15 +102,11 @@ class Trainer:
         
         self.model = self.model.float().to(self.device)
         
-        # Initialize EMA if enabled
-        if self.config.get('training.use_ema', True):
-            self.ema = ModelEMA(self.model)
-        else:
-            self.ema = None  
-        
         logger.info(f"Model created with {sum(p.numel() for p in self.model.parameters()):,} parameters")
     
     def setup_loss(self):
+        from complete_yolo_loss import YOLOLoss
+        
         self.criterion = YOLOLoss(
             model=self.model,
             num_classes=self.config.get('model.num_classes', 1),
@@ -197,6 +165,8 @@ class Trainer:
                 self.scaler = None
     
     def load_datasets(self):
+        from brats_dataset import BraTSDataset, collate_fn
+        
         data_dir = self.config.get('data.data_dir', './data')
         img_size = self.config.get('model.img_size', 640)
         batch_size = self.config.get('training.batch_size', 8)
@@ -206,28 +176,22 @@ class Trainer:
         # Check if data directories exist
         train_dir = Path(data_dir) / 'train'
         val_dir = Path(data_dir) / 'val'
+        test_dir = Path(data_dir) / 'test'
         
         if not train_dir.exists():
             raise FileNotFoundError(f"Training directory not found: {train_dir}")
-        if not val_dir.exists():
-            # Try 'test' instead of 'val'
-            val_dir = Path(data_dir) / 'test'
-            if not val_dir.exists():
-                raise FileNotFoundError(f"Validation directory not found. Tried both 'val' and 'test'")
         
-        # Check for image files
-        train_images = list((train_dir / 'images').glob('*_t1.png'))
-        val_images = list((val_dir / 'images').glob('*_t1.png'))
+        # Use val if exists, otherwise use test
+        if val_dir.exists():
+            val_split_dir = val_dir
+            val_split_name = 'val'
+        elif test_dir.exists():
+            val_split_dir = test_dir
+            val_split_name = 'test'
+        else:
+            raise FileNotFoundError(f"Neither val nor test directory found in {data_dir}")
         
-        logger.info(f"Found {len(train_images)} training image groups")
-        logger.info(f"Found {len(val_images)} validation image groups")
-        
-        if len(train_images) == 0:
-            logger.error("No training images found!")
-            logger.info(f"Training images directory: {train_dir / 'images'}")
-            available_files = list((train_dir / 'images').glob('*.png'))
-            logger.info(f"Available files: {[f.name for f in available_files[:10]]}")
-            raise ValueError("No training data found")
+        logger.info(f"Using {val_split_name} as validation set")
         
         # Training dataset
         self.train_dataset = BraTSDataset(
@@ -242,9 +206,8 @@ class Trainer:
         )
         
         # Validation dataset
-        val_split = 'val' if (Path(data_dir) / 'val').exists() else 'test'
         self.val_dataset = BraTSDataset(
-            data_dir, split=val_split, img_size=img_size, augment=False
+            data_dir, split=val_split_name, img_size=img_size, augment=False
         )
         
         self.val_loader = DataLoader(
@@ -305,10 +268,6 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                     self.optimizer.step()
                 
-                # Update EMA
-                if self.ema is not None:
-                    self.ema.update(self.model)
-                
                 # Update metrics
                 total_loss += loss.item()
                 total_components['box_loss'] += loss_components[0].item()
@@ -341,9 +300,7 @@ class Trainer:
     
     def validate_epoch(self):
         """Validate for one epoch"""
-        # Use EMA model if available
-        model = self.ema.ema if self.ema is not None else self.model
-        model.eval()
+        self.model.eval()
         
         total_loss = 0.0
         total_components = {'box_loss': 0.0, 'obj_loss': 0.0, 'cls_loss': 0.0}
@@ -360,7 +317,7 @@ class Trainer:
                     }
                     
                     # Forward pass
-                    predictions = model(images)
+                    predictions = self.model(images)
                     loss, loss_components = self.criterion(predictions, targets)
                     
                     total_loss += loss.item()
@@ -381,91 +338,6 @@ class Trainer:
         
         return avg_loss, avg_components
     
-    def evaluate_map(self, data_loader, max_samples=None):
-        """Evaluate mAP on dataset using simple metric calculation"""
-        model = self.ema.ema if self.ema is not None else self.model
-        model.eval()
-        
-        all_predictions = []
-        all_ground_truths = []
-        
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(data_loader, desc='Evaluating mAP')):
-                if max_samples and batch_idx >= max_samples:
-                    break
-                
-                images = batch['images'].to(self.device, dtype=torch.float32, non_blocking=True)    
-                # Forward pass
-                predictions = model(images)
-                
-                # Simple post-processing for evaluation
-                for i in range(images.shape[0]):
-                    image_predictions = []
-                    
-                    # Process each scale
-                    for scale_idx, (cls_score, bbox_pred, objectness) in enumerate(predictions):
-                        obj_probs = torch.sigmoid(objectness[i])
-                        
-                        # Find confident detections
-                        confidence_threshold = self.config.get('model.confidence_threshold', 0.25)
-                        confidence_mask = obj_probs > confidence_threshold
-                        
-                        if confidence_mask.any():
-                            # Extract detections (simplified approach)
-                            num_anchors = obj_probs.shape[0]
-                            h, w = obj_probs.shape[1], obj_probs.shape[2]
-                            
-                            for anchor in range(num_anchors):
-                                for y in range(h):
-                                    for x in range(w):
-                                        if confidence_mask[anchor, y, x]:
-                                            conf = obj_probs[anchor, y, x].item()
-                                            
-                                            # Simple bbox extraction
-                                            x_center = (x + 0.5) / w
-                                            y_center = (y + 0.5) / h
-                                            width = 0.1  # Simplified
-                                            height = 0.1  # Simplified
-                                            
-                                            image_predictions.append({
-                                                'bbox': [x_center, y_center, width, height],
-                                                'confidence': conf,
-                                                'class_id': 0
-                                            })
-                    
-                    all_predictions.extend(image_predictions)
-                    
-                    # Extract ground truth
-                    gt_bboxes = batch['bboxes'][i]
-                    gt_labels = batch['labels'][i]
-                    
-                    for bbox, label in zip(gt_bboxes, gt_labels):
-                        if label > 0:  # Valid annotation
-                            all_ground_truths.append({
-                                'bbox': bbox.cpu().tolist(),
-                                'class_id': label.item() - 1  # Convert to 0-based
-                            })
-        
-        # Calculate simple metrics
-        if all_ground_truths and all_predictions:
-            # Simple precision/recall calculation
-            tp = min(len(all_predictions), len(all_ground_truths))
-            precision = tp / len(all_predictions) if all_predictions else 0.0
-            recall = tp / len(all_ground_truths) if all_ground_truths else 0.0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-            
-            metrics = {
-                'mAP': f1,  # Use F1 as proxy for mAP
-                'mAP50': f1,
-                'precision': precision,
-                'recall': recall,
-                'f1_score': f1
-            }
-        else:
-            metrics = {'mAP': 0.0, 'mAP50': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1_score': 0.0}
-        
-        return metrics
-    
     def save_checkpoint(self, filename='checkpoint.pth', is_best=False):
         """Save model checkpoint"""
         checkpoint = {
@@ -474,7 +346,6 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
-            'ema_state_dict': self.ema.ema.state_dict() if self.ema else None,
             'best_loss': self.best_loss,
             'best_map': self.best_map,
             'train_losses': self.train_losses,
@@ -490,31 +361,6 @@ class Trainer:
             best_path = self.output_dir / 'checkpoints' / 'best_model.pth'
             torch.save(checkpoint, best_path)
             logger.info(f"Saved best model to {best_path}")
-    
-    def load_checkpoint(self, checkpoint_path):
-        """Load model checkpoint"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-        if self.scheduler and checkpoint['scheduler_state_dict']:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        if self.scaler and checkpoint['scaler_state_dict']:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            
-        if self.ema and checkpoint['ema_state_dict']:
-            self.ema.ema.load_state_dict(checkpoint['ema_state_dict'])
-        
-        self.current_epoch = checkpoint['epoch']
-        self.best_loss = checkpoint['best_loss']
-        self.best_map = checkpoint['best_map']
-        self.train_losses = checkpoint['train_losses']
-        self.val_losses = checkpoint['val_losses']
-        self.learning_rates = checkpoint.get('learning_rates', [])
-        
-        logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
     
     def plot_training_curves(self):
         """Plot and save training curves"""
@@ -538,83 +384,25 @@ class Trainer:
         plt.subplot(2, 3, 2)
         if self.learning_rates:
             plt.plot(epochs, self.learning_rates, 'g-', linewidth=2)
-        else:
-            # Approximate LR if not logged
-            if isinstance(self.scheduler, optim.lr_scheduler.CosineAnnealingLR):
-                T_max = self.scheduler.T_max
-                initial_lr = self.optimizer.param_groups[0]['lr']
-                lrs = [initial_lr * (1 + np.cos(np.pi * epoch / T_max)) / 2 for epoch in epochs]
-                plt.plot(epochs, lrs, 'g-', linewidth=2)
-        
-        plt.title('Learning Rate Schedule', fontsize=14)
-        plt.xlabel('Epoch')
-        plt.ylabel('Learning Rate')
-        plt.grid(True, alpha=0.3)
-        plt.yscale('log')
-        
-        # Loss components (approximated from total loss)
-        plt.subplot(2, 3, 3)
-        plt.plot(epochs, [l * 0.5 for l in self.train_losses], 'b-', label='Box Loss (approx)', alpha=0.7)
-        plt.plot(epochs, [l * 0.4 for l in self.train_losses], 'r-', label='Obj Loss (approx)', alpha=0.7)
-        plt.plot(epochs, [l * 0.1 for l in self.train_losses], 'g-', label='Cls Loss (approx)', alpha=0.7)
-        plt.title('Loss Components (Approximated)', fontsize=14)
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        # Moving averages
-        plt.subplot(2, 3, 4)
-        if len(self.train_losses) >= 10:
-            window = min(10, len(self.train_losses) // 5)
-            train_ma = np.convolve(self.train_losses, np.ones(window)/window, mode='valid')
-            val_ma = np.convolve(self.val_losses, np.ones(window)/window, mode='valid')
-            ma_epochs = range(window, len(self.train_losses) + 1)
-            
-            plt.plot(ma_epochs, train_ma, 'b-', label=f'Train MA({window})', linewidth=2)
-            plt.plot(ma_epochs, val_ma, 'r-', label=f'Val MA({window})', linewidth=2)
-            plt.title('Moving Average Loss', fontsize=14)
+            plt.title('Learning Rate Schedule', fontsize=14)
             plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.legend()
+            plt.ylabel('Learning Rate')
             plt.grid(True, alpha=0.3)
-        
-        # Loss difference
-        plt.subplot(2, 3, 5)
-        loss_diff = [v - t for t, v in zip(self.train_losses, self.val_losses)]
-        plt.plot(epochs, loss_diff, 'purple', linewidth=2)
-        plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-        plt.title('Validation - Training Loss', fontsize=14)
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss Difference')
-        plt.grid(True, alpha=0.3)
+            plt.yscale('log')
         
         # Training progress summary
-        plt.subplot(2, 3, 6)
+        plt.subplot(2, 3, 3)
         plt.text(0.1, 0.9, f"Current Epoch: {self.current_epoch}", fontsize=12, transform=plt.gca().transAxes)
         plt.text(0.1, 0.8, f"Best Loss: {self.best_loss:.4f}", fontsize=12, transform=plt.gca().transAxes)
-        plt.text(0.1, 0.7, f"Best mAP: {self.best_map:.4f}", fontsize=12, transform=plt.gca().transAxes)
-        plt.text(0.1, 0.6, f"Current LR: {self.optimizer.param_groups[0]['lr']:.6f}", fontsize=12, transform=plt.gca().transAxes)
-        
-        if len(self.train_losses) >= 2:
-            trend = "↓" if self.train_losses[-1] < self.train_losses[-2] else "↑"
-            plt.text(0.1, 0.5, f"Loss Trend: {trend}", fontsize=12, transform=plt.gca().transAxes)
-        
-        plt.text(0.1, 0.4, f"Model: Multimodal PK-YOLO", fontsize=12, transform=plt.gca().transAxes)
-        plt.text(0.1, 0.3, f"Dataset: BraTS2020", fontsize=12, transform=plt.gca().transAxes)
+        plt.text(0.1, 0.7, f"Current LR: {self.optimizer.param_groups[0]['lr']:.6f}", fontsize=12, transform=plt.gca().transAxes)
+        plt.text(0.1, 0.5, f"Model: Multimodal PK-YOLO", fontsize=12, transform=plt.gca().transAxes)
+        plt.text(0.1, 0.4, f"Dataset: BraTS2020", fontsize=12, transform=plt.gca().transAxes)
         plt.title('Training Summary', fontsize=14)
         plt.axis('off')
         
         plt.tight_layout()
         plt.savefig(self.output_dir / 'training_curves.png', dpi=150, bbox_inches='tight')
         plt.close()
-    
-    def log_metrics(self, metrics, step, prefix=""):
-        """Log metrics to wandb if available"""
-        if WANDB_AVAILABLE:
-            log_dict = {f"{prefix}{k}" if prefix else k: v for k, v in metrics.items()}
-            log_dict['epoch'] = step
-            wandb.log(log_dict)
     
     def train(self):
         """Main training loop"""
@@ -624,7 +412,6 @@ class Trainer:
         
         # Configuration
         num_epochs = self.config.get('training.num_epochs', 100)
-        eval_interval = self.config.get('validation.eval_interval', 10)
         save_interval = self.config.get('logging.save_interval', 25)
         
         # Initialize wandb
@@ -674,13 +461,6 @@ class Trainer:
                     f"Time: {epoch_time:.1f}s"
                 )
                 
-                # Detailed component logging
-                logger.info(
-                    f"  Train Components - Box: {train_components['box_loss']:.4f}, "
-                    f"Obj: {train_components['obj_loss']:.4f}, "
-                    f"Cls: {train_components['cls_loss']:.4f}"
-                )
-                
                 # Log to wandb
                 if use_wandb:
                     metrics = {
@@ -691,38 +471,12 @@ class Trainer:
                         **{f'train_{k}': v for k, v in train_components.items()},
                         **{f'val_{k}': v for k, v in val_components.items()}
                     }
-                    self.log_metrics(metrics, epoch)
-                
-                # Evaluate mAP periodically
-                if epoch % eval_interval == 0 or epoch == num_epochs - 1:
-                    logger.info("Evaluating mAP...")
-                    eval_start_time = time.time()
-                    
-                    # Evaluate on validation set (subset for speed)
-                    val_metrics = self.evaluate_map(self.val_loader, max_samples=min(50, len(self.val_loader)))
-                    eval_time = time.time() - eval_start_time
-                    
-                    logger.info(
-                        f"  Validation Metrics (eval time: {eval_time:.1f}s) - "
-                        f"mAP: {val_metrics['mAP']:.4f}, "
-                        f"Precision: {val_metrics['precision']:.4f}, "
-                        f"Recall: {val_metrics['recall']:.4f}, "
-                        f"F1: {val_metrics['f1_score']:.4f}"
-                    )
-                    
-                    if use_wandb:
-                        self.log_metrics(val_metrics, epoch, prefix="val_")
-                    
-                    # Save best model based on mAP
-                    if val_metrics['mAP'] > self.best_map:
-                        self.best_map = val_metrics['mAP']
-                        self.save_checkpoint('best_model_map.pth', is_best=True)
-                        logger.info(f"New best mAP: {self.best_map:.4f}")
+                    wandb.log(metrics, step=epoch)
                 
                 # Save best model based on loss
                 if val_loss < self.best_loss:
                     self.best_loss = val_loss
-                    self.save_checkpoint('best_model_loss.pth', is_best=True)
+                    self.save_checkpoint('best_model.pth', is_best=True)
                     logger.info(f"New best loss: {self.best_loss:.4f}")
                 
                 # Early stopping check
@@ -754,15 +508,6 @@ class Trainer:
             self.save_checkpoint('final_model.pth')
             logger.info("Final model saved")
             
-            # Final evaluation
-            if len(self.val_loader) > 0:
-                logger.info("Running final evaluation...")
-                final_metrics = self.evaluate_map(self.val_loader, max_samples=100)
-                logger.info(f"Final validation metrics: {final_metrics}")
-                
-                if use_wandb:
-                    self.log_metrics(final_metrics, self.current_epoch, prefix="final_")
-            
             # Generate final plots
             self.plot_training_curves()
             
@@ -783,12 +528,11 @@ def create_default_config():
             'nms_threshold': 0.45
         },
         'training': {
-            'batch_size': 8,
+            'batch_size': 4,  # Reduced for 4-channel input
             'num_epochs': 100,
             'learning_rate': 0.001,
             'weight_decay': 0.0001,
             'mixed_precision': True,
-            'use_ema': True,
             'early_stopping': True,
             'patience': 20,
             'min_delta': 0.001
@@ -815,9 +559,6 @@ def create_default_config():
             'type': 'AdamW',
             'lr_scheduler': 'CosineAnnealingLR'
         },
-        'validation': {
-            'eval_interval': 10
-        },
         'logging': {
             'output_dir': 'outputs',
             'save_interval': 25,
@@ -825,18 +566,6 @@ def create_default_config():
             'wandb_project': 'multimodal-pk-yolo'
         }
     }
-
-def save_config_file(config_dict, path='config.yaml'):
-    """Save configuration to YAML file"""
-    with open(path, 'w') as f:
-        yaml.dump(config_dict, f, default_flow_style=False, indent=2)
-    logger.info(f"Configuration saved to {path}")
-
-def load_config_file(path):
-    """Load configuration from YAML file"""
-    with open(path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
 
 class SimpleConfig:
     """Simple configuration class"""
@@ -883,27 +612,23 @@ def validate_data_structure(data_dir):
     if missing_dirs:
         raise FileNotFoundError(f"Missing required directories: {missing_dirs}")
     
-    # Check for training images
-    train_images = list((data_path / 'train/images').glob('*_t1.png'))
-    if len(train_images) == 0:
-        # Try different naming patterns
-        train_images = list((data_path / 'train/images').glob('*.png'))
-        if len(train_images) == 0:
+    # Check for training images based on your naming pattern
+    train_images_dir = data_path / 'train/images'
+    
+    # Look for BraTS pattern files
+    pattern_files = list(train_images_dir.glob('BraTS20_Training_*_t1.png'))
+    if len(pattern_files) == 0:
+        # Look for any PNG files
+        pattern_files = list(train_images_dir.glob('*.png'))
+        if len(pattern_files) == 0:
             raise ValueError("No training images found in train/images/")
         else:
-            logger.warning(f"Found {len(train_images)} images but none with _t1.png suffix")
-    
-    # Check for validation images if val split exists
-    if val_split:
-        val_images = list((data_path / val_split / 'images').glob('*_t1.png'))
-        if len(val_images) == 0:
-            val_images = list((data_path / val_split / 'images').glob('*.png'))
-            if len(val_images) == 0:
-                logger.warning(f"No validation images found in {val_split}/images/")
+            logger.warning(f"Found {len(pattern_files)} images but not in expected BraTS naming pattern")
     
     logger.info(f"Data validation passed!")
-    logger.info(f"  Training images: {len(train_images)}")
+    logger.info(f"  Training images found: {len(pattern_files)}")
     if val_split:
+        val_images = list((data_path / val_split / 'images').glob('*.png'))
         logger.info(f"  Validation images: {len(val_images)} (split: {val_split})")
     
     return True
@@ -917,25 +642,21 @@ def main():
                        help='Path to dataset directory')
     
     # Optional configuration
-    parser.add_argument('--config', type=str, 
-                       help='Path to configuration file')
     parser.add_argument('--output_dir', type=str, default='outputs', 
                        help='Output directory for logs and checkpoints')
     
     # Training parameters
-    parser.add_argument('--batch_size', type=int, 
-                       help='Batch size (overrides config)')
-    parser.add_argument('--epochs', type=int, 
-                       help='Number of epochs (overrides config)')
-    parser.add_argument('--lr', type=float, 
-                       help='Learning rate (overrides config)')
+    parser.add_argument('--batch_size', type=int, default=4,
+                       help='Batch size')
+    parser.add_argument('--epochs', type=int, default=100,
+                       help='Number of epochs')
+    parser.add_argument('--lr', type=float, default=0.001,
+                       help='Learning rate')
     parser.add_argument('--img_size', type=int, default=640,
                        help='Input image size')
     
     # Hardware settings
-    parser.add_argument('--device', type=str, choices=['auto', 'cpu', 'cuda'], 
-                       default='auto', help='Device to use')
-    parser.add_argument('--workers', type=int, 
+    parser.add_argument('--workers', type=int, default=4,
                        help='Number of data loader workers')
     parser.add_argument('--mixed_precision', action='store_true',
                        help='Enable mixed precision training')
@@ -943,39 +664,18 @@ def main():
     # Training control
     parser.add_argument('--resume', type=str, 
                        help='Path to checkpoint to resume from')
-    parser.add_argument('--validate_only', action='store_true', 
-                       help='Only run validation')
-    parser.add_argument('--no_early_stopping', action='store_true',
-                       help='Disable early stopping')
-    parser.add_argument('--no_ema', action='store_true',
-                       help='Disable Exponential Moving Average')
+    parser.add_argument('--validate_data', action='store_true',
+                       help='Validate data structure and exit')
     
     # Logging and monitoring
     parser.add_argument('--wandb', action='store_true', 
                        help='Enable wandb logging')
     parser.add_argument('--project', type=str, default='multimodal-pk-yolo', 
                        help='Wandb project name')
-    parser.add_argument('--save_interval', type=int, default=25,
-                       help='Checkpoint saving interval')
-    parser.add_argument('--eval_interval', type=int, default=10,
-                       help='Evaluation interval')
-    
-    # Utility options
-    parser.add_argument('--create_config', action='store_true', 
-                       help='Create default config file and exit')
-    parser.add_argument('--validate_data', action='store_true',
-                       help='Validate data structure and exit')
     
     args = parser.parse_args()
     
-    # Handle utility options
-    if args.create_config:
-        config_dict = create_default_config()
-        save_config_file(config_dict, 'config.yaml')
-        print("Default configuration saved to config.yaml")
-        print("Edit the file as needed, then run training with: --config config.yaml")
-        return
-    
+    # Handle data validation
     if args.validate_data:
         try:
             validate_data_structure(args.data_dir)
@@ -985,15 +685,7 @@ def main():
         return
     
     # Load configuration
-    if args.config and Path(args.config).exists():
-        config_dict = load_config_file(args.config)
-        logger.info(f"Loaded configuration from {args.config}")
-    else:
-        config_dict = create_default_config()
-        logger.info("Using default configuration")
-        if args.config:
-            logger.warning(f"Config file {args.config} not found, using defaults")
-    
+    config_dict = create_default_config()
     config = SimpleConfig(config_dict)
     
     # Override config with command line arguments
@@ -1013,23 +705,9 @@ def main():
         config.config['data']['num_workers'] = args.workers
     if args.mixed_precision:
         config.config['training']['mixed_precision'] = True
-    if args.no_early_stopping:
-        config.config['training']['early_stopping'] = False
-    if args.no_ema:
-        config.config['training']['use_ema'] = False
     if args.wandb:
         config.config['logging']['use_wandb'] = True
         config.config['logging']['wandb_project'] = args.project
-    if args.save_interval:
-        config.config['logging']['save_interval'] = args.save_interval
-    if args.eval_interval:
-        config.config['validation']['eval_interval'] = args.eval_interval
-    
-    # Set device
-    if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = args.device
     
     # Validate data directory
     try:
@@ -1049,9 +727,7 @@ def main():
     logger.info(f"  Epochs: {config.get('training.num_epochs')}")
     logger.info(f"  Learning rate: {config.get('training.learning_rate')}")
     logger.info(f"  Image size: {config.get('model.img_size')}")
-    logger.info(f"  Device: {device}")
     logger.info(f"  Mixed precision: {config.get('training.mixed_precision')}")
-    logger.info(f"  EMA: {config.get('training.use_ema')}")
     logger.info(f"  Early stopping: {config.get('training.early_stopping')}")
     logger.info(f"  Wandb logging: {config.get('logging.use_wandb')}")
     logger.info("=" * 60)
@@ -1074,33 +750,12 @@ def main():
             logger.error(f"Checkpoint file not found: {args.resume}")
             return
     
-    # Run validation only if specified
-    if args.validate_only:
-        logger.info("Running validation only...")
-        try:
-            val_loss, val_components = trainer.validate_epoch()
-            val_metrics = trainer.evaluate_map(trainer.val_loader, max_samples=50)
-            
-            logger.info("Validation Results:")
-            logger.info(f"  Loss: {val_loss:.4f}")
-            logger.info(f"  Box Loss: {val_components['box_loss']:.4f}")
-            logger.info(f"  Obj Loss: {val_components['obj_loss']:.4f}")
-            logger.info(f"  Cls Loss: {val_components['cls_loss']:.4f}")
-            logger.info(f"  mAP: {val_metrics['mAP']:.4f}")
-            logger.info(f"  Precision: {val_metrics['precision']:.4f}")
-            logger.info(f"  Recall: {val_metrics['recall']:.4f}")
-            logger.info(f"  F1-Score: {val_metrics['f1_score']:.4f}")
-        except Exception as e:
-            logger.error(f"Validation failed: {e}")
-        return
-    
     # Start training
     try:
         logger.info("Starting training process...")
         trainer.train()
         logger.info("🎉 Training completed successfully!")
         logger.info(f"📊 Best validation loss: {trainer.best_loss:.4f}")
-        logger.info(f"📈 Best mAP: {trainer.best_map:.4f}")
         logger.info(f"💾 Models saved in: {trainer.output_dir / 'checkpoints'}")
         logger.info(f"📋 Training curves: {trainer.output_dir / 'training_curves.png'}")
         
