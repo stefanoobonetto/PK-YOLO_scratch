@@ -1,33 +1,20 @@
-"""
-Multimodal PK-YOLO Implementation for Brain Tumor Detection
-4-Channel Backbone Setup with RepViT + SparK + YOLOv9
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
-from torchvision.transforms import functional as TF
 
-import os
 import cv2
 import numpy as np
-import glob
-from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-import yaml
 import logging
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
-import math
-from collections import defaultdict
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+from complete_yolo_loss import YOLOLoss, bbox_iou, FocalLoss, smooth_BCE
 
 class DWConv(nn.Module):
     """Depth-wise convolution"""
@@ -76,7 +63,6 @@ class RepViTBlock(nn.Module):
         out = self.act(self.bn2(self.dwconv(out)))
         out = self.bn3(self.conv2(out))
         
-        # Apply attention
         out = out * self.se(out)
         
         if self.identity:
@@ -85,9 +71,6 @@ class RepViTBlock(nn.Module):
         return out
 
 class SparKRepViTBackbone(nn.Module):
-    """
-    SparK-pretrained RepViT backbone adapted for 4-channel multimodal input
-    """
     def __init__(self, input_channels=4, width_mult=1.0):
         super().__init__()
         
@@ -276,12 +259,13 @@ class YOLOv9Head(nn.Module):
         
         return cls_score, bbox_pred, objectness
 
+
 class MultimodalPKYOLO(nn.Module):
-    """Complete Multimodal PK-YOLO model"""
+    """Complete Multimodal PK-YOLO model with proper loss integration"""
     def __init__(self, num_classes=1, input_channels=4):
         super().__init__()
         
-        # Store as attributes for EMA setup
+        # Model configuration
         self.num_classes = num_classes
         self.input_channels = input_channels
         
@@ -297,12 +281,24 @@ class MultimodalPKYOLO(nn.Module):
         # Head
         self.head = YOLOv9Head(num_classes=num_classes)
         
-        # Anchors for different scales
+        # Anchors for different scales (optimized for brain tumor sizes)
         self.anchors = torch.tensor([
-            [[10, 13], [16, 30], [33, 23]],      # P3/8
-            [[30, 61], [62, 45], [59, 119]],     # P4/16
-            [[116, 90], [156, 198], [373, 326]]  # P5/32
+            [[10, 13], [16, 30], [33, 23]],      # P3/8 - small tumors
+            [[30, 61], [62, 45], [59, 119]],     # P4/16 - medium tumors  
+            [[116, 90], [156, 198], [373, 326]]  # P5/32 - large tumors
         ], dtype=torch.float32)
+        
+        # Hyperparameters for training (used by loss function)
+        self.hyp = {
+            'box': 0.05,           # Box loss weight
+            'cls': 0.5,            # Class loss weight  
+            'obj': 1.0,            # Object loss weight
+            'anchor_t': 4.0,       # Anchor matching threshold
+            'fl_gamma': 0.0,       # Focal loss gamma (0 = no focal loss)
+            'cls_pw': 1.0,         # Class positive weight
+            'obj_pw': 1.0,         # Object positive weight
+            'label_smoothing': 0.0, # Label smoothing epsilon
+        }
 
     def forward(self, x):
         # Extract features using backbone
@@ -491,35 +487,14 @@ def collate_fn(batch):
         'slice_ids': [item['slice_id'] for item in batch]
     }
 
-class YOLOLoss(nn.Module):
-    """YOLO Loss Function"""
-    
-    def __init__(self, num_classes=1, ignore_thresh=0.5):
-        super().__init__()
-        self.num_classes = num_classes
-        self.ignore_thresh = ignore_thresh
-        self.mse_loss = nn.MSELoss()
-        self.bce_loss = nn.BCEWithLogitsLoss()
-        
-    def forward(self, predictions, targets):
-        # Implement YOLO loss calculation
-        # This is a simplified version - you may want to implement the full YOLOv9 loss
-        total_loss = 0
-        
-        for pred in predictions:
-            cls_score, bbox_pred, objectness = pred
-            # Calculate loss components
-            # obj_loss, cls_loss, bbox_loss = self.calculate_loss(cls_score, bbox_pred, objectness, targets)
-            # total_loss += obj_loss + cls_loss + bbox_loss
-        
-        return total_loss
-
 def train_model(model, train_loader, val_loader, num_epochs=100, device='cuda'):
-    """Training loop"""
+    """Enhanced training loop with complete YOLO loss function"""
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-    criterion = YOLOLoss()
+    
+    # Initialize the complete YOLO loss
+    criterion = YOLOLoss(model, num_classes=1, autobalance=True)
     
     best_loss = float('inf')
     
@@ -527,47 +502,98 @@ def train_model(model, train_loader, val_loader, num_epochs=100, device='cuda'):
         # Training phase
         model.train()
         train_loss = 0.0
+        train_box_loss = 0.0
+        train_obj_loss = 0.0
+        train_cls_loss = 0.0
         
         for batch_idx, batch in enumerate(train_loader):
             images = batch['images'].to(device)
             
+            # Move target data to device
+            targets = {
+                'bboxes': batch['bboxes'].to(device),
+                'labels': batch['labels'].to(device),
+                'images': images
+            }
+            
             optimizer.zero_grad()
             predictions = model(images)
-            loss = criterion(predictions, batch)
             
-            loss.backward()
+            # Calculate loss using the complete YOLO loss function
+            total_loss, loss_components = criterion(predictions, targets)
+            
+            total_loss.backward()
             optimizer.step()
             
-            train_loss += loss.item()
+            # Track losses
+            train_loss += total_loss.item()
+            train_box_loss += loss_components[0].item()
+            train_obj_loss += loss_components[1].item()
+            train_cls_loss += loss_components[2].item()
             
-            if batch_idx % 100 == 0:
-                logger.info(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}')
+            if batch_idx % 50 == 0:
+                logger.info(f'Epoch {epoch}, Batch {batch_idx}, '
+                          f'Total Loss: {total_loss.item():.4f}, '
+                          f'Box: {loss_components[0].item():.4f}, '
+                          f'Obj: {loss_components[1].item():.4f}, '
+                          f'Cls: {loss_components[2].item():.4f}')
         
         # Validation phase
         model.eval()
         val_loss = 0.0
+        val_box_loss = 0.0
+        val_obj_loss = 0.0
+        val_cls_loss = 0.0
         
         with torch.no_grad():
             for batch in val_loader:
                 images = batch['images'].to(device)
+                targets = {
+                    'bboxes': batch['bboxes'].to(device),
+                    'labels': batch['labels'].to(device),
+                    'images': images
+                }
+                
                 predictions = model(images)
-                loss = criterion(predictions, batch)
-                val_loss += loss.item()
+                total_loss, loss_components = criterion(predictions, targets)
+                
+                val_loss += total_loss.item()
+                val_box_loss += loss_components[0].item()
+                val_obj_loss += loss_components[1].item()
+                val_cls_loss += loss_components[2].item()
         
+        # Calculate average losses
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
         
-        logger.info(f'Epoch {epoch}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}')
+        logger.info(f'Epoch {epoch}: '
+                   f'Train Loss: {avg_train_loss:.4f} '
+                   f'(Box: {train_box_loss/len(train_loader):.4f}, '
+                   f'Obj: {train_obj_loss/len(train_loader):.4f}, '
+                   f'Cls: {train_cls_loss/len(train_loader):.4f}), '
+                   f'Val Loss: {avg_val_loss:.4f} '
+                   f'(Box: {val_box_loss/len(val_loader):.4f}, '
+                   f'Obj: {val_obj_loss/len(val_loader):.4f}, '
+                   f'Cls: {val_cls_loss/len(val_loader):.4f})')
         
         # Save best model
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
-            torch.save(model.state_dict(), 'best_multimodal_pk_yolo.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_val_loss,
+                'anchors': model.anchors,
+                'hyp': model.hyp
+            }, 'best_multimodal_pk_yolo.pth')
+            logger.info(f'New best model saved with validation loss: {avg_val_loss:.4f}')
         
         scheduler.step()
 
+
 def main():
-    """Main training function"""
+    """Main training function with complete loss integration"""
     # Configuration
     config = {
         'data_dir': '/path/to/BraTS2020_TrainingData_ok',
@@ -577,6 +603,9 @@ def main():
         'num_classes': 1,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
+    
+    logger.info(f"Using device: {config['device']}")
+    logger.info(f"Training for {config['num_epochs']} epochs with batch size {config['batch_size']}")
     
     # Create datasets
     train_dataset = BraTSDataset(
@@ -599,7 +628,8 @@ def main():
         batch_size=config['batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=4
+        num_workers=4,
+        pin_memory=True
     )
     
     val_loader = DataLoader(
@@ -607,13 +637,19 @@ def main():
         batch_size=config['batch_size'],
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4
+        num_workers=4,
+        pin_memory=True
     )
     
     # Create model
-    model = MultimodalPKYOLO(num_classes=config['num_classes'])
+    model = MultimodalPKYOLO(
+        num_classes=config['num_classes'], 
+        input_channels=4  # T1, T1ce, T2, FLAIR
+    )
     
-    # Start training
+    logger.info(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
+    
+    # Start training with complete loss function
     train_model(
         model, 
         train_loader, 
@@ -622,5 +658,274 @@ def main():
         device=config['device']
     )
 
-if __name__ == "__main__":
-    main()
+
+# def load_pretrained_model(checkpoint_path, device='cuda'):
+#     """Load a pretrained multimodal PK-YOLO model"""
+#     checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+#     model = MultimodalPKYOLO(num_classes=1, input_channels=4)
+#     model.load_state_dict(checkpoint['model_state_dict'])
+#     model = model.to(device)
+#     model.eval()
+    
+#     logger.info(f"Loaded pretrained model from {checkpoint_path}")
+#     logger.info(f"Best validation loss: {checkpoint['loss']:.4f}")
+    
+#     return model
+
+
+# def predict_brain_tumors(model, image_tensor, device='cuda', conf_threshold=0.5):
+#     """
+#     Predict brain tumors from a 4-channel MRI image
+#     Args:
+#         model: Trained MultimodalPKYOLO model
+#         image_tensor: Input tensor of shape [1, 4, H, W] (T1, T1ce, T2, FLAIR)
+#         device: Device to run inference on
+#         conf_threshold: Confidence threshold for detections
+#     Returns:
+#         List of detections [x1, y1, x2, y2, confidence, class]
+#     """
+#     model.eval()
+#     image_tensor = image_tensor.to(device)
+    
+#     with torch.no_grad():
+#         predictions = model(image_tensor)
+        
+#         # Post-process predictions to get final detections
+#         detections = post_process_predictions(
+#             predictions, 
+#             conf_threshold=conf_threshold,
+#             image_size=image_tensor.shape[-2:]
+#         )
+    
+#     return detections
+
+
+# def post_process_predictions(predictions, conf_threshold=0.5, nms_threshold=0.4, image_size=(640, 640)):
+#     """
+#     Post-process YOLO predictions to get final detections
+#     Args:
+#         predictions: Raw model predictions
+#         conf_threshold: Confidence threshold
+#         nms_threshold: NMS threshold
+#         image_size: Original image size
+#     Returns:
+#         Final detections after NMS
+#     """
+#     detections = []
+    
+#     for i, (cls_score, bbox_pred, objectness) in enumerate(predictions):
+#         # Get grid size
+#         grid_h, grid_w = cls_score.shape[-2:]
+        
+#         # Create grid coordinates
+#         grid_y, grid_x = torch.meshgrid(
+#             torch.arange(grid_h), 
+#             torch.arange(grid_w), 
+#             indexing='ij'
+#         )
+#         grid_y = grid_y.to(cls_score.device).float()
+#         grid_x = grid_x.to(cls_score.device).float()
+        
+#         # Reshape predictions
+#         batch_size = cls_score.shape[0]
+#         num_anchors = 3
+        
+#         cls_score = cls_score.view(batch_size, num_anchors, -1, grid_h, grid_w).permute(0, 1, 3, 4, 2)
+#         bbox_pred = bbox_pred.view(batch_size, num_anchors, 4, grid_h, grid_w).permute(0, 1, 3, 4, 2)
+#         objectness = objectness.view(batch_size, num_anchors, 1, grid_h, grid_w).permute(0, 1, 3, 4, 2)
+        
+#         # Apply sigmoid and process coordinates
+#         obj_conf = torch.sigmoid(objectness)
+#         cls_conf = torch.sigmoid(cls_score)
+        
+#         # Convert bbox predictions to actual coordinates
+#         stride = image_size[0] // grid_h  # Assuming square images
+        
+#         # Box center coordinates
+#         box_xy = (torch.sigmoid(bbox_pred[..., :2]) * 1.6 - 0.3 + torch.stack([grid_x, grid_y], dim=-1)) * stride
+        
+#         # Box width and height  
+#         anchors = torch.tensor([
+#             [10, 13], [16, 30], [33, 23]  # Adjust based on scale
+#         ], device=cls_score.device).float()
+        
+#         if i == 1:  # P4
+#             anchors = torch.tensor([[30, 61], [62, 45], [59, 119]], device=cls_score.device).float()
+#         elif i == 2:  # P5
+#             anchors = torch.tensor([[116, 90], [156, 198], [373, 326]], device=cls_score.device).float()
+        
+#         box_wh = (0.2 + torch.sigmoid(bbox_pred[..., 2:4]) * 4.8) * anchors.view(1, -1, 1, 1, 2)
+        
+#         # Combine confidence scores
+#         conf = obj_conf * cls_conf
+        
+#         # Filter by confidence threshold
+#         conf_mask = conf.squeeze(-1) > conf_threshold
+        
+#         if conf_mask.any():
+#             # Convert to [x1, y1, x2, y2] format
+#             box_x1y1 = box_xy - box_wh / 2
+#             box_x2y2 = box_xy + box_wh / 2
+#             boxes = torch.cat([box_x1y1, box_x2y2], dim=-1)
+            
+#             # Get valid detections
+#             valid_boxes = boxes[conf_mask]
+#             valid_conf = conf[conf_mask]
+            
+#             detections.append({
+#                 'boxes': valid_boxes,
+#                 'scores': valid_conf,
+#                 'scale_idx': i
+#             })
+    
+#     return detections
+
+
+# def evaluate_model(model, val_loader, device='cuda'):
+#     """
+#     Evaluate the model on validation set
+#     Args:
+#         model: Trained model
+#         val_loader: Validation data loader
+#         device: Device to run evaluation on
+#     Returns:
+#         Evaluation metrics
+#     """
+#     model.eval()
+#     criterion = YOLOLoss(model, num_classes=1, autobalance=False)
+    
+#     total_loss = 0.0
+#     total_box_loss = 0.0
+#     total_obj_loss = 0.0
+#     total_cls_loss = 0.0
+#     num_batches = 0
+    
+#     with torch.no_grad():
+#         for batch in val_loader:
+#             images = batch['images'].to(device)
+#             targets = {
+#                 'bboxes': batch['bboxes'].to(device),
+#                 'labels': batch['labels'].to(device),
+#                 'images': images
+#             }
+            
+#             predictions = model(images)
+#             loss, loss_components = criterion(predictions, targets)
+            
+#             total_loss += loss.item()
+#             total_box_loss += loss_components[0].item()
+#             total_obj_loss += loss_components[1].item()
+#             total_cls_loss += loss_components[2].item()
+#             num_batches += 1
+    
+#     avg_loss = total_loss / num_batches
+#     avg_box_loss = total_box_loss / num_batches
+#     avg_obj_loss = total_obj_loss / num_batches
+#     avg_cls_loss = total_cls_loss / num_batches
+    
+#     logger.info(f"Validation Results:")
+#     logger.info(f"Average Total Loss: {avg_loss:.4f}")
+#     logger.info(f"Average Box Loss: {avg_box_loss:.4f}")
+#     logger.info(f"Average Objectness Loss: {avg_obj_loss:.4f}")
+#     logger.info(f"Average Classification Loss: {avg_cls_loss:.4f}")
+    
+#     return {
+#         'total_loss': avg_loss,
+#         'box_loss': avg_box_loss,
+#         'obj_loss': avg_obj_loss,
+#         'cls_loss': avg_cls_loss
+#     }
+
+# def apply_multimodal_preprocessing(t1_path, t1ce_path, t2_path, flair_path, target_size=(640, 640)):
+#     """
+#     Preprocess 4-channel MRI data for the model
+#     Args:
+#         t1_path, t1ce_path, t2_path, flair_path: Paths to individual modality images
+#         target_size: Target image size
+#     Returns:
+#         Preprocessed 4-channel tensor
+#     """
+#     modalities = []
+    
+#     for path in [t1_path, t1ce_path, t2_path, flair_path]:
+#         img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+#         if img is None:
+#             raise ValueError(f"Could not load image: {path}")
+        
+#         # Resize to target size
+#         img = cv2.resize(img, target_size)
+        
+#         # Normalize to [0, 1]
+#         img = img.astype(np.float32) / 255.0
+        
+#         modalities.append(img)
+    
+#     # Stack modalities and create tensor
+#     multimodal_img = np.stack(modalities, axis=0)  # [4, H, W]
+    
+#     # Apply normalization (same as training)
+#     mean = np.array([0.485, 0.456, 0.406, 0.485])
+#     std = np.array([0.229, 0.224, 0.225, 0.229])
+    
+#     for i in range(4):
+#         multimodal_img[i] = (multimodal_img[i] - mean[i]) / std[i]
+    
+#     return torch.tensor(multimodal_img).unsqueeze(0)  # Add batch dimension
+
+
+# def visualize_detections(image_tensor, detections, save_path=None):
+#     """
+#     Visualize detections on the input image
+#     Args:
+#         image_tensor: Input 4-channel tensor [1, 4, H, W]
+#         detections: List of detections
+#         save_path: Path to save visualization
+#     """
+#     import matplotlib.pyplot as plt
+#     import matplotlib.patches as patches
+    
+#     # Use T1ce modality for visualization (channel 1)
+#     img = image_tensor[0, 1].cpu().numpy()
+    
+#     # Denormalize for visualization
+#     img = img * 0.224 + 0.456  # Reverse normalization
+#     img = np.clip(img, 0, 1)
+    
+#     fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+#     ax.imshow(img, cmap='gray')
+    
+#     # Draw detections
+#     for det_group in detections:
+#         if 'boxes' in det_group:
+#             boxes = det_group['boxes'].cpu().numpy()
+#             scores = det_group['scores'].cpu().numpy()
+            
+#             for box, score in zip(boxes, scores):
+#                 x1, y1, x2, y2 = box
+#                 width = x2 - x1
+#                 height = y2 - y1
+                
+#                 # Draw bounding box
+#                 rect = patches.Rectangle(
+#                     (x1, y1), width, height, 
+#                     linewidth=2, edgecolor='red', facecolor='none'
+#                 )
+#                 ax.add_patch(rect)
+                
+#                 # Add confidence score
+#                 ax.text(x1, y1-5, f'{score:.2f}', 
+#                        color='red', fontsize=12, fontweight='bold')
+    
+#     ax.set_title('Brain Tumor Detection Results')
+#     ax.axis('off')
+    
+#     if save_path:
+#         plt.savefig(save_path, bbox_inches='tight', dpi=300)
+#         logger.info(f"Visualization saved to {save_path}")
+    
+#     plt.show()
+
+
+# if __name__ == "__main__":
+#     main()

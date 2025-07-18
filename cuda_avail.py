@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-CUDA Availability and System Information Checker
-"""
-
 import sys
 import platform
 import subprocess

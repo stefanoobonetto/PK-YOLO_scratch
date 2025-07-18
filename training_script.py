@@ -296,9 +296,7 @@ class ModelEMA:
                 if v.dtype.is_floating_point:
                     v.mul_(d).add_(msd[k].detach(), alpha=(1 - d))
 
-class Trainer:
-    """Main training class with comprehensive features"""
-    
+class Trainer:    
     def __init__(self, config):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -324,7 +322,6 @@ class Trainer:
         self.setup_utilities()
         
     def setup_model(self):
-        """Initialize model"""
         from multimodal_pk_yolo import MultimodalPKYOLO
         
         self.model = MultimodalPKYOLO(
@@ -332,17 +329,14 @@ class Trainer:
             input_channels=self.config.get('model.input_channels', 4)
         )
         
-        # Store device info and ensure all parameters are float32
-        self.model.device = self.device  # Add device attribute
+        self.model.device = self.device  
         self.model = self.model.float().to(self.device)
         
-        # Model EMA - disable for now to avoid issues
-        self.ema = None  # Temporarily disable EMA
+        self.ema = None  
         
         logger.info(f"Model created with {sum(p.numel() for p in self.model.parameters()):,} parameters")
     
     def setup_loss(self):
-        """Initialize loss function"""
         self.criterion = ImprovedYOLOLoss(
             num_classes=self.config.get('model.num_classes', 1),
             ignore_thresh=self.config.get('loss.ignore_threshold', 0.5),
@@ -351,8 +345,6 @@ class Trainer:
         )
     
     def setup_optimizer(self):
-        """Initialize optimizer and scheduler"""
-        # Optimizer
         optimizer_type = self.config.get('optimizer.type', 'AdamW')
         lr = self.config.get('training.learning_rate', 1e-3)
         weight_decay = self.config.get('training.weight_decay', 1e-4)
@@ -364,7 +356,6 @@ class Trainer:
         else:
             raise ValueError(f"Unknown optimizer: {optimizer_type}")
         
-        # Scheduler
         scheduler_type = self.config.get('optimizer.lr_scheduler', 'CosineAnnealingLR')
         num_epochs = self.config.get('training.num_epochs', 100)
         
@@ -378,7 +369,6 @@ class Trainer:
             self.scheduler = None
     
     def setup_directories(self):
-        """Create output directories"""
         self.output_dir = Path(self.config.get('logging.output_dir', 'outputs'))
         self.output_dir.mkdir(exist_ok=True)
         
@@ -387,8 +377,6 @@ class Trainer:
         (self.output_dir / 'visualizations').mkdir(exist_ok=True)
     
     def setup_utilities(self):
-        """Setup training utilities"""
-        # Early stopping
         if self.config.get('training.early_stopping', True):
             self.early_stopping = EarlyStopping(
                 patience=self.config.get('training.patience', 20),
@@ -397,14 +385,12 @@ class Trainer:
         else:
             self.early_stopping = None
         
-        # Gradient scaler for mixed precision - disabled due to type mismatch issues
-        self.scaler = None  # Disable mixed precision for now
+        self.scaler = None  # Disable mixed precision for 
         if self.config.get('training.mixed_precision', False):
             logger.warning("Mixed precision disabled due to compatibility issues")
             self.config.config['training']['mixed_precision'] = False
     
     def load_datasets(self):
-        """Load training and validation datasets"""
         from multimodal_pk_yolo import BraTSDataset, collate_fn
         
         data_dir = self.config.get('data.data_dir', './data')
@@ -1047,39 +1033,28 @@ def main():
     """Main function with argument parsing"""
     parser = argparse.ArgumentParser(description='Train Multimodal PK-YOLO for Brain Tumor Detection')
     
-    # Essential arguments
     parser.add_argument('--config', type=str, help='Path to configuration file')
     parser.add_argument('--data_dir', type=str, required=True, help='Path to dataset directory')
     parser.add_argument('--output_dir', type=str, default='outputs', help='Output directory')
-    
-    # Training arguments
     parser.add_argument('--batch_size', type=int, help='Batch size')
     parser.add_argument('--epochs', type=int, help='Number of epochs')
     parser.add_argument('--lr', type=float, help='Learning rate')
     parser.add_argument('--resume', type=str, help='Path to checkpoint to resume from')
-    
-    # Action arguments
     parser.add_argument('--validate_only', action='store_true', help='Only run validation')
     parser.add_argument('--create_config', action='store_true', help='Create default config file')
-    
-    # Hardware arguments
     parser.add_argument('--device', type=str, choices=['auto', 'cpu', 'cuda'], default='auto', help='Device to use')
     parser.add_argument('--workers', type=int, help='Number of data loader workers')
-    
-    # Logging arguments
     parser.add_argument('--wandb', action='store_true', help='Enable wandb logging')
     parser.add_argument('--project', type=str, default='multimodal-pk-yolo', help='Wandb project name')
     
     args = parser.parse_args()
     
-    # Create default config if requested
     if args.create_config:
         config_dict = create_default_config()
         save_config_file(config_dict, 'config.yaml')
         print("Default configuration saved to config.yaml")
         return
     
-    # Load configuration
     if args.config and Path(args.config).exists():
         config_dict = load_config_file(args.config)
         logger.info(f"Loaded configuration from {args.config}")
@@ -1089,7 +1064,6 @@ def main():
     
     config = SimpleConfig(config_dict)
     
-    # Override config with command line arguments
     if args.data_dir:
         config.config['data']['data_dir'] = args.data_dir
     if args.output_dir:
@@ -1106,28 +1080,19 @@ def main():
         config.config['logging']['use_wandb'] = True
         config.config['logging']['wandb_project'] = args.project
     
-    # Set device
     if args.device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     else:
         device = args.device
     
-    # Validate data directory
     data_dir = Path(config.get('data.data_dir'))
-    if not data_dir.exists():
-        logger.error(f"Data directory {data_dir} does not exist!")
-        logger.info("Please run data preprocessing first:")
-        logger.info("python data_utils.py --action convert --input_dir /path/to/BraTS2020 --output_dir ./data")
-        return
-    
-    # Check required subdirectories
+
     required_dirs = ['train/images', 'train/labels', 'val/images', 'val/labels']
     missing_dirs = [d for d in required_dirs if not (data_dir / d).exists()]
     if missing_dirs:
         logger.error(f"Missing required directories: {missing_dirs}")
         return
     
-    # Quick dataset validation
     logger.info("Validating dataset structure...")
     train_images = list((data_dir / 'train/images').glob('*_t1.png'))
     val_images = list((data_dir / 'val/images').glob('*_t1.png'))
@@ -1140,7 +1105,6 @@ def main():
     
     logger.info(f"Found {len(train_images)} training samples, {len(val_images)} validation samples")
     
-    # Print configuration summary
     logger.info("Configuration Summary:")
     logger.info(f"  Data directory: {data_dir}")
     logger.info(f"  Output directory: {config.get('logging.output_dir')}")
@@ -1151,7 +1115,6 @@ def main():
     logger.info(f"  Mixed precision: {config.get('training.mixed_precision')}")
     logger.info(f"  Wandb logging: {config.get('logging.use_wandb')}")
     
-    # Initialize trainer
     try:
         trainer = Trainer(config)
         trainer.load_datasets()
@@ -1159,7 +1122,6 @@ def main():
         logger.error(f"Failed to initialize trainer: {e}")
         return
     
-    # Resume from checkpoint if specified
     if args.resume:
         if Path(args.resume).exists():
             trainer.load_checkpoint(args.resume)
@@ -1168,7 +1130,6 @@ def main():
             logger.error(f"Checkpoint file not found: {args.resume}")
             return
     
-    # Run validation only if requested
     if args.validate_only:
         logger.info("Running validation only...")
         try:
@@ -1183,7 +1144,6 @@ def main():
             logger.error(f"Validation failed: {e}")
         return
     
-    # Start training
     try:
         trainer.train()
     except Exception as e:
