@@ -153,7 +153,7 @@ class SparKRepViTBackbone(nn.Module):
         return feature_maps
 
 class CrossModalAttention(nn.Module):
-    """Cross-modal attention for multimodal feature fusion"""
+    """Cross-modal attention for multimodal feature fusion - Memory efficient version"""
     def __init__(self, channels):
         super().__init__()
         self.channels = channels
@@ -165,18 +165,38 @@ class CrossModalAttention(nn.Module):
     def forward(self, x):
         B, C, H, W = x.size()
         
-        # Generate queries, keys, values
-        q = self.query(x).view(B, -1, W * H).permute(0, 2, 1)
-        k = self.key(x).view(B, -1, W * H)
-        v = self.value(x).view(B, -1, W * H)
-        
-        # Attention
-        attention = torch.bmm(q, k)
-        attention = F.softmax(attention, dim=-1)
-        
-        # Apply attention to values
-        out = torch.bmm(v, attention.permute(0, 2, 1))
-        out = out.view(B, C, H, W)
+        # Use smaller spatial dimensions to reduce memory
+        if H * W > 64 * 64:  # If spatial size is too large
+            # Downsample for attention computation
+            x_small = F.adaptive_avg_pool2d(x, (32, 32))  # Fixed small size
+            _, _, h_small, w_small = x_small.size()
+            
+            # Generate queries, keys, values on downsampled feature
+            q = self.query(x_small).view(B, -1, w_small * h_small).permute(0, 2, 1)
+            k = self.key(x_small).view(B, -1, w_small * h_small)
+            v = self.value(x_small).view(B, -1, w_small * h_small)
+            
+            # Attention
+            attention = torch.bmm(q, k)
+            attention = F.softmax(attention, dim=-1)
+            
+            # Apply attention to values
+            out_small = torch.bmm(v, attention.permute(0, 2, 1))
+            out_small = out_small.view(B, C, h_small, w_small)
+            
+            # Upsample back to original size
+            out = F.interpolate(out_small, size=(H, W), mode='bilinear', align_corners=False)
+        else:
+            # Original attention for small feature maps
+            q = self.query(x).view(B, -1, W * H).permute(0, 2, 1)
+            k = self.key(x).view(B, -1, W * H)
+            v = self.value(x).view(B, -1, W * H)
+            
+            attention = torch.bmm(q, k)
+            attention = F.softmax(attention, dim=-1)
+            
+            out = torch.bmm(v, attention.permute(0, 2, 1))
+            out = out.view(B, C, H, W)
         
         # Residual connection with learnable weight
         out = self.gamma * out + x
@@ -261,6 +281,10 @@ class MultimodalPKYOLO(nn.Module):
     def __init__(self, num_classes=1, input_channels=4):
         super().__init__()
         
+        # Store as attributes for EMA setup
+        self.num_classes = num_classes
+        self.input_channels = input_channels
+        
         # Backbone
         self.backbone = SparKRepViTBackbone(input_channels=input_channels)
         
@@ -320,14 +344,30 @@ class BraTSDataset(Dataset):
         """Extract unique slice identifiers from image filenames"""
         slice_ids = set()
         
-        for img_file in self.image_dir.glob('*.png'):
-            # Extract slice ID from filename (remove modality suffix)
-            # Expected format: BraTS20_Training_002_slice_029_t1.png
+        # Look for all PNG files in the images directory
+        image_files = list(self.image_dir.glob('*.png'))
+        
+        for img_file in image_files:
             filename = img_file.stem
-            parts = filename.split('_')
-            if len(parts) >= 4:
-                slice_id = '_'.join(parts[:-1])  # Remove last part (modality)
+            
+            # Check if this is a modality-specific file (ends with _t1, _t1ce, _t2, _flair)
+            if filename.endswith(('_t1', '_t1ce', '_t2', '_flair')):
+                # Remove the modality suffix to get the slice ID
+                if filename.endswith('_t1ce'):
+                    slice_id = filename[:-5]  # Remove '_t1ce'
+                elif filename.endswith('_flair'):
+                    slice_id = filename[:-6]  # Remove '_flair'
+                else:
+                    slice_id = filename[:-3]  # Remove '_t1' or '_t2'
+                
                 slice_ids.add(slice_id)
+            else:
+                # If no modality suffix found, use the filename as is
+                slice_ids.add(filename)
+        
+        if not slice_ids:
+            logger.warning(f"No slice IDs found in {self.image_dir}")
+            logger.info(f"Available files: {[f.name for f in image_files[:10]]}")  # Show first 10 files
         
         return sorted(list(slice_ids))
 
@@ -335,7 +375,7 @@ class BraTSDataset(Dataset):
         """Setup image transformations"""
         if self.augment:
             self.transform = A.Compose([
-                A.RandomResizedCrop(self.img_size, self.img_size, scale=(0.8, 1.0)),
+                A.Resize(self.img_size, self.img_size),
                 A.HorizontalFlip(p=0.5),
                 A.RandomBrightnessContrast(p=0.3),
                 A.RandomGamma(p=0.3),
@@ -429,20 +469,20 @@ class BraTSDataset(Dataset):
 
 def collate_fn(batch):
     """Custom collate function for DataLoader"""
-    images = torch.stack([item['image'] for item in batch])
+    images = torch.stack([item['image'] for item in batch]).float()  # Ensure float32
     
     # Handle variable number of bboxes per image
     max_boxes = max(len(item['bboxes']) for item in batch)
     if max_boxes == 0:
         max_boxes = 1
     
-    batch_bboxes = torch.zeros(len(batch), max_boxes, 4)
+    batch_bboxes = torch.zeros(len(batch), max_boxes, 4, dtype=torch.float32)
     batch_labels = torch.zeros(len(batch), max_boxes, dtype=torch.long)
     
     for i, item in enumerate(batch):
         if len(item['bboxes']) > 0:
-            batch_bboxes[i, :len(item['bboxes'])] = torch.from_numpy(item['bboxes'])
-            batch_labels[i, :len(item['class_labels'])] = torch.from_numpy(item['class_labels'])
+            batch_bboxes[i, :len(item['bboxes'])] = torch.from_numpy(item['bboxes']).float()
+            batch_labels[i, :len(item['class_labels'])] = torch.from_numpy(item['class_labels']).long()
     
     return {
         'images': images,

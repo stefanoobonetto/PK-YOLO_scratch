@@ -278,12 +278,14 @@ class ModelEMA:
         self.updates = 0
         
         # Create EMA model
-        self.ema = type(model)(model.num_classes, model.input_channels)
+        from multimodal_pk_yolo import MultimodalPKYOLO
+        self.ema = MultimodalPKYOLO(model.num_classes, model.input_channels)
         self.ema.load_state_dict(model.state_dict())
         for p in self.ema.parameters():
             p.requires_grad_(False)
     
     def update(self, model):
+        import math
         with torch.no_grad():
             self.updates += 1
             d = self.decay * (1 - math.exp(-self.updates / self.tau))  # Ramp up EMA
@@ -328,7 +330,10 @@ class Trainer:
         self.model = MultimodalPKYOLO(
             num_classes=self.config.get('model.num_classes', 1),
             input_channels=self.config.get('model.input_channels', 4)
-        ).to(self.device)
+        )
+        
+        # Ensure all parameters are float32 and move to device
+        self.model = self.model.float().to(self.device)
         
         # Model EMA
         if self.config.get('training.use_ema', True):
@@ -394,11 +399,11 @@ class Trainer:
         else:
             self.early_stopping = None
         
-        # Gradient scaler for mixed precision
-        if self.config.get('training.mixed_precision', True):
-            self.scaler = torch.cuda.amp.GradScaler()
-        else:
-            self.scaler = None
+        # Gradient scaler for mixed precision - disabled due to type mismatch issues
+        self.scaler = None  # Disable mixed precision for now
+        if self.config.get('training.mixed_precision', False):
+            logger.warning("Mixed precision disabled due to compatibility issues")
+            self.config.config['training']['mixed_precision'] = False
     
     def load_datasets(self):
         """Load training and validation datasets"""
@@ -409,6 +414,28 @@ class Trainer:
         batch_size = self.config.get('training.batch_size', 8)
         num_workers = self.config.get('data.num_workers', 4)
         pin_memory = self.config.get('data.pin_memory', True)
+        
+        # Check if data directories exist
+        train_dir = Path(data_dir) / 'train'
+        val_dir = Path(data_dir) / 'val'
+        
+        if not train_dir.exists():
+            raise FileNotFoundError(f"Training directory not found: {train_dir}")
+        if not val_dir.exists():
+            raise FileNotFoundError(f"Validation directory not found: {val_dir}")
+        
+        # Check for image files
+        train_images = list((train_dir / 'images').glob('*.png'))
+        val_images = list((val_dir / 'images').glob('*.png'))
+        
+        logger.info(f"Found {len(train_images)} image files in training directory")
+        logger.info(f"Found {len(val_images)} image files in validation directory")
+        
+        if len(train_images) == 0:
+            logger.error("No training images found!")
+            logger.info(f"Training images directory: {train_dir / 'images'}")
+            logger.info(f"Files in training directory: {list((train_dir / 'images').iterdir())[:10]}")
+            raise ValueError("No training data found")
         
         # Training dataset
         self.train_dataset = BraTSDataset(
@@ -436,6 +463,11 @@ class Trainer:
         logger.info(f"Loaded {len(self.val_dataset)} validation samples")
         logger.info(f"Training batches: {len(self.train_loader)}")
         logger.info(f"Validation batches: {len(self.val_loader)}")
+        
+        if len(self.train_dataset) == 0:
+            raise ValueError("Training dataset is empty! Check your data preprocessing.")
+        if len(self.val_dataset) == 0:
+            raise ValueError("Validation dataset is empty! Check your data preprocessing.")
     
     def train_epoch(self):
         """Train for one epoch"""
@@ -447,28 +479,17 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch}')
         
         for batch_idx, batch in enumerate(pbar):
-            images = batch['images'].to(self.device, non_blocking=True)
-            targets = {
-                'bboxes': batch['bboxes'].to(self.device, non_blocking=True),
-                'labels': batch['labels'].to(self.device, non_blocking=True)
-            }
-            
-            # Zero gradients
-            self.optimizer.zero_grad()
-            
-            # Forward pass with mixed precision
-            if self.scaler is not None:
-                with torch.cuda.amp.autocast():
-                    predictions = self.model(images)
-                    loss, loss_components = self.criterion(predictions, targets, self.current_epoch)
+            try:
+                images = batch['images'].to(self.device, dtype=torch.float32, non_blocking=True)
+                targets = {
+                    'bboxes': batch['bboxes'].to(self.device, dtype=torch.float32, non_blocking=True),
+                    'labels': batch['labels'].to(self.device, non_blocking=True)
+                }
                 
-                # Backward pass
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
+                # Zero gradients
+                self.optimizer.zero_grad()
+                
+                # Forward pass
                 predictions = self.model(images)
                 loss, loss_components = self.criterion(predictions, targets, self.current_epoch)
                 
@@ -476,26 +497,34 @@ class Trainer:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
+                
+                # Update EMA
+                if self.ema is not None:
+                    self.ema.update(self.model)
+                
+                # Update metrics
+                total_loss += loss.item()
+                for key in total_components:
+                    total_components[key] += loss_components[key]
+                
+                # Update progress bar
+                if batch_idx % 10 == 0:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    pbar.set_postfix({
+                        'Loss': f'{loss.item():.4f}',
+                        'Obj': f'{loss_components["obj_loss"]:.4f}',
+                        'Cls': f'{loss_components["cls_loss"]:.4f}',
+                        'BBox': f'{loss_components["bbox_loss"]:.4f}',
+                        'LR': f'{current_lr:.6f}'
+                    })
             
-            # Update EMA
-            if self.ema is not None:
-                self.ema.update(self.model)
-            
-            # Update metrics
-            total_loss += loss.item()
-            for key in total_components:
-                total_components[key] += loss_components[key]
-            
-            # Update progress bar
-            if batch_idx % 10 == 0:
-                current_lr = self.optimizer.param_groups[0]['lr']
-                pbar.set_postfix({
-                    'Loss': f'{loss.item():.4f}',
-                    'Obj': f'{loss_components["obj_loss"]:.4f}',
-                    'Cls': f'{loss_components["cls_loss"]:.4f}',
-                    'BBox': f'{loss_components["bbox_loss"]:.4f}',
-                    'LR': f'{current_lr:.6f}'
-                })
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    logger.error(f"CUDA OOM at batch {batch_idx}. Clearing cache and skipping batch.")
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
         
         avg_loss = total_loss / num_batches
         avg_components = {k: v / num_batches for k, v in total_components.items()}
@@ -514,23 +543,28 @@ class Trainer:
         
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc='Validation'):
-                images = batch['images'].to(self.device, non_blocking=True)
-                targets = {
-                    'bboxes': batch['bboxes'].to(self.device, non_blocking=True),
-                    'labels': batch['labels'].to(self.device, non_blocking=True)
-                }
-                
-                if self.scaler is not None:
-                    with torch.cuda.amp.autocast():
-                        predictions = model(images)
-                        loss, loss_components = self.criterion(predictions, targets, self.current_epoch)
-                else:
+                try:
+                    images = batch['images'].to(self.device, dtype=torch.float32, non_blocking=True)
+                    targets = {
+                        'bboxes': batch['bboxes'].to(self.device, dtype=torch.float32, non_blocking=True),
+                        'labels': batch['labels'].to(self.device, non_blocking=True)
+                    }
+                    
+                    # Forward pass
                     predictions = model(images)
                     loss, loss_components = self.criterion(predictions, targets, self.current_epoch)
+                    
+                    total_loss += loss.item()
+                    for key in total_components:
+                        total_components[key] += loss_components[key]
                 
-                total_loss += loss.item()
-                for key in total_components:
-                    total_components[key] += loss_components[key]
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        logger.warning("CUDA OOM during validation. Clearing cache and continuing.")
+                        torch.cuda.empty_cache()
+                        continue
+                    else:
+                        raise e
         
         avg_loss = total_loss / num_batches
         avg_components = {k: v / num_batches for k, v in total_components.items()}
@@ -549,14 +583,11 @@ class Trainer:
             for batch_idx, batch in enumerate(tqdm(data_loader, desc='Evaluating mAP')):
                 if max_samples and batch_idx >= max_samples:
                     break
-                    
-                images = batch['images'].to(self.device, non_blocking=True)
                 
-                if self.scaler is not None:
-                    with torch.cuda.amp.autocast():
-                        predictions = model(images)
-                else:
-                    predictions = model(images)
+                
+                images = batch['images'].to(self.device, dtype=torch.float32, non_blocking=True)    
+                # Forward pass
+                predictions = model(images)
                 
                 # Simple post-processing for evaluation
                 for i in range(images.shape[0]):

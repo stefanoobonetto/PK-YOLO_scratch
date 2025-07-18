@@ -1,0 +1,21 @@
+# Convert BraTS NIfTI files to YOLO format
+python data_utils.py --action convert --input_dir C:\Users\stefano.bonetto\PK-YOLO_scratch\BraTS2020_TrainingData --output_dir ./data
+
+# Validate dataset
+python data_utils.py --action validate --data_dir ./data
+
+# Analyze statistics
+python data_utils.py --action analyze --data_dir ./data
+
+
+
+TRAINING
+
+# Basic training
+python training_script.py --data_dir ./data
+
+# Advanced training with custom parameters
+python training_script.py --data_dir ./data --batch_size 16 --epochs 200 --lr 0.0005
+
+# Resume from checkpoint
+python training_script.py --data_dir ./data --resume ./outputs/checkpoints/best_model.pth
