@@ -280,8 +280,10 @@ class YOLOLoss(nn.Module):
         return targets
     
     def _prepare_predictions(self, predictions):
+        """Convert predictions with validation"""
+        p = []
         for i, (cls_score, bbox_pred, objectness) in enumerate(predictions):
-            # check for NaN in predictions
+            # Check for NaN in predictions
             if torch.isnan(cls_score).any() or torch.isnan(bbox_pred).any() or torch.isnan(objectness).any():
                 logger.warning(f"NaN detected in predictions at scale {i}")
                 # Replace NaN with small values

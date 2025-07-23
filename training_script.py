@@ -13,7 +13,7 @@ from utils.utils import get_train_arg_parser
 from utils.early_stopping import EarlyStopping
 from multimodal_pk_yolo import MultimodalPKYOLO
 from brats_dataset import BraTSDataset, collate_fn
-from visualization import TrainingVisualizer
+from visualization import DebugVisualizer
 
 warnings.filterwarnings('ignore')
 
@@ -96,10 +96,8 @@ class Trainer:
                 self.scaler = None
         
         # Visualization setup
-        self.visualizer = TrainingVisualizer(
-            output_dir=str(self.output_dir),
-            save_interval=self.config.get('visualization.save_interval', 100)
-        )
+        self.debug_vis = DebugVisualizer(str(self.output_dir), save_interval=100)
+    
         
         logger.info(f"🎨 Training visualizer initialized - saving every {self.config.get('visualization.save_interval', 100)} batches")
                 
@@ -201,6 +199,8 @@ class Trainer:
                     # fwd
                     predictions = self.model(images)
                     loss, loss_components = self.criterion(predictions, targets)
+                                        
+                    self.debug_vis.save_batch_debug(batch_idx, self.current_epoch, images, targets)
                     
                     # bwd 
                     loss.backward()
@@ -520,8 +520,7 @@ def main():
     parser = get_train_arg_parser()
     
     # Add visualization-specific arguments
-    parser.add_argument('--vis_interval', type=int, default=20, 
-                       help='Save visualization every N batches')
+    parser.add_argument('--vis_interval', type=int, default=20, help='Save visualization every N batches')
     parser.add_argument('--vis_modality', type=int, default=1, choices=[0,1,2,3],
                        help='Modality to use for visualization (0=T1, 1=T1ce, 2=T2, 3=FLAIR)')
     
