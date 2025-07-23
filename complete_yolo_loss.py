@@ -1,21 +1,12 @@
-"""
-Fixed YOLO Loss with NaN protection and numerical stability
-Addresses the NaN loss issue in training
-"""
-
+import math
 import torch
+import logging
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from typing import Tuple, List
-import logging
 
 logger = logging.getLogger(__name__)
 
 class YOLOLoss(nn.Module):
-    """
-    Numerically stable YOLO Loss with NaN protection
-    """
     
     def __init__(self, model, num_classes=1, anchors=None, autobalance=False):
         super().__init__()
@@ -24,23 +15,24 @@ class YOLOLoss(nn.Module):
         self.device = device
         self.num_classes = num_classes
         
-        # More conservative hyperparameters to prevent NaN
+        # conservative hyps
         self.hyp = {
-            'box': 0.05,           # Box loss weight
-            'cls': 0.3,            # Class loss weight  
-            'obj': 1.0,            # Object loss weight
-            'anchor_t': 4.0,       # Anchor matching threshold
-            'fl_gamma': 0.0,       # Focal loss gamma (disabled to prevent NaN)
-            'cls_pw': 1.0,         # Class positive weight
-            'obj_pw': 1.0,         # Object positive weight
-            'label_smoothing': 0.0, # No label smoothing to start
+            'box': 0.05,                # Box loss weight
+            'cls': 0.3,                 # Class loss weight  
+            'obj': 1.0,                 # Object loss weight
+            'anchor_t': 4.0,            # Anchor matching threshold
+            'fl_gamma': 0.0,            # Focal loss gamma (disabled to prevent NaN)
+            'cls_pw': 1.0,              # Class positive weight
+            'obj_pw': 1.0,              # Object positive weight
+            'label_smoothing': 0.0,     # No label smoothing to start
         }
         
-        # Loss functions with reduction='none' for better control
+        # https://docs.pytorch.org/docs/stable/generated/torch.nn.BCEWithLogitsLoss.html
         self.BCEcls = nn.BCEWithLogitsLoss(reduction='none')
         self.BCEobj = nn.BCEWithLogitsLoss(reduction='none')
         
-        # Anchors optimized for brain tumors
+        # Anchors COCO 
+        # TODO --> maybe use KMeans for custom anchors
         if anchors is None:
             self.anchors = torch.tensor([
                 [[10, 13], [16, 30], [33, 23]],      # P3/8
@@ -53,20 +45,13 @@ class YOLOLoss(nn.Module):
         self.nl = len(self.anchors)
         self.na = self.anchors.shape[1]
         
-        # Balance weights
         self.balance = [4.0, 1.0, 0.25] if self.nl == 3 else [1.0] * self.nl
         self.autobalance = autobalance
         self.gr = 1.0
-        
-        logger.info(f"YOLOLoss: Numerical stability enabled, NaN protection active")
-        
-    def forward(self, predictions, targets):
-        """Forward pass with NaN protection"""
-        
-        # Prepare targets
+            
+    def forward(self, predictions, targets):        
         targets_tensor = self._prepare_targets(targets)
         
-        # Convert predictions
         p = self._prepare_predictions(predictions)
         
         # Adjust for model architecture
@@ -253,7 +238,13 @@ class YOLOLoss(nn.Module):
         return iou
     
     def _prepare_targets(self, targets):
-        """Prepare targets with validation"""
+        # batch in train_loader
+        # targets = {
+        #     'bboxes': batch['bboxes'],
+        #     'labels': batch['labels'],
+        #     'images': images
+        # }
+        
         if isinstance(targets, dict):
             batch_size = targets['images'].shape[0]
             target_list = []

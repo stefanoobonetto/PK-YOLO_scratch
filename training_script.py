@@ -1,119 +1,44 @@
-"""
-Fixed Complete Training Script for Multimodal PK-YOLO
-Corrected for proper BraTS 2020 dataset structure and training
-"""
-
+import time
 import torch
-import torch.nn as nn
+import logging
+import warnings
+from tqdm import tqdm
+from pathlib import Path
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import torch.nn.functional as F
 
-import os
-import time
-import yaml
-import json
-import argparse
-from pathlib import Path
-import numpy as np
-from typing import Dict, List, Tuple, Optional
-import logging
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import warnings
+# utils
+from complete_yolo_loss import YOLOLoss
+from utils.utils import get_train_arg_parser
+from utils.early_stopping import EarlyStopping
+from multimodal_pk_yolo import MultimodalPKYOLO
+from brats_dataset import BraTSDataset, collate_fn
+
 warnings.filterwarnings('ignore')
 
-# Try to import wandb for logging
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    print("Warning: wandb not available. Install with: pip install wandb")
-
-# Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class EarlyStopping:
-    """Early stopping utility"""
-    
-    def __init__(self, patience=20, min_delta=0.001, restore_best_weights=True):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.restore_best_weights = restore_best_weights
-        self.best_loss = None
-        self.counter = 0
-        self.best_weights = None
-        
-    def __call__(self, val_loss, model):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-            self.save_checkpoint(model)
-        elif val_loss < self.best_loss - self.min_delta:
-            self.best_loss = val_loss
-            self.counter = 0
-            self.save_checkpoint(model)
-        else:
-            self.counter += 1
-            
-        if self.counter >= self.patience:
-            if self.restore_best_weights:
-                model.load_state_dict(self.best_weights)
-            return True
-        return False
-    
-    def save_checkpoint(self, model):
-        self.best_weights = model.state_dict().copy()
-
 class Trainer:    
     def __init__(self, config):
+        
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Using device: {self.device}")
-        
-        # Model setup
-        self.setup_model()
-        self.setup_loss()
-        self.setup_optimizer()
-        
-        # Training state
-        self.current_epoch = 0
-        self.best_loss = float('inf')
-        self.best_map = 0.0
-        self.train_losses = []
-        self.val_losses = []
-        self.learning_rates = []
-        
-        # Setup directories
-        self.setup_directories()
-        
-        # Setup utilities
-        self.setup_utilities()
-        
-    def setup_model(self):
-        # Import the fixed model
-        from multimodal_pk_yolo import MultimodalPKYOLO
-        
+                
+        # model setup 
         self.model = MultimodalPKYOLO(
             num_classes=self.config.get('model.num_classes', 1),
             input_channels=self.config.get('model.input_channels', 4)
-        )
-        
-        self.model = self.model.float().to(self.device)
-        
-        logger.info(f"Model created with {sum(p.numel() for p in self.model.parameters()):,} parameters")
-    
-    def setup_loss(self):
-        from complete_yolo_loss import YOLOLoss
-        
+        ).float().to(self.device)
+                
+        # loss criterion setup
         self.criterion = YOLOLoss(
             model=self.model,
             num_classes=self.config.get('model.num_classes', 1),
             autobalance=True
         )
-    
-    def setup_optimizer(self):
+        
+        # optimizer setup
         optimizer_type = self.config.get('optimizer.type', 'AdamW')
         lr = self.config.get('training.learning_rate', 1e-3)
         weight_decay = self.config.get('training.weight_decay', 1e-4)
@@ -136,16 +61,23 @@ class Trainer:
             self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=30, gamma=0.1)
         else:
             self.scheduler = None
-    
-    def setup_directories(self):
+            
+        self.current_epoch = 0
+        self.best_loss = float('inf')
+        self.best_map = 0.0
+        self.train_losses = []
+        self.val_losses = []
+        self.learning_rates = []
+        
+        # setup output directories
         self.output_dir = Path(self.config.get('logging.output_dir', 'outputs'))
         self.output_dir.mkdir(exist_ok=True)
         
         (self.output_dir / 'checkpoints').mkdir(exist_ok=True)
         (self.output_dir / 'logs').mkdir(exist_ok=True)
         (self.output_dir / 'visualizations').mkdir(exist_ok=True)
-    
-    def setup_utilities(self):
+        
+        # early stopping 
         if self.config.get('training.early_stopping', True):
             self.early_stopping = EarlyStopping(
                 patience=self.config.get('training.patience', 20),
@@ -154,18 +86,15 @@ class Trainer:
         else:
             self.early_stopping = None
         
-        # Setup mixed precision
+        # setup mixed precision
         self.scaler = None
         if self.config.get('training.mixed_precision', False):
             try:
                 self.scaler = torch.cuda.amp.GradScaler()
-                logger.info("Mixed precision training enabled")
             except:
-                logger.warning("Mixed precision not available, using standard training")
                 self.scaler = None
-    
+                
     def load_datasets(self):
-        from brats_dataset import BraTSDataset, collate_fn
         
         data_dir = self.config.get('data.data_dir', './data')
         img_size = self.config.get('model.img_size', 640)
@@ -226,7 +155,6 @@ class Trainer:
             logger.warning("Validation dataset is empty!")
     
     def train_epoch(self):
-        """Train for one epoch"""
         self.model.train()
         total_loss = 0.0
         total_components = {'box_loss': 0.0, 'obj_loss': 0.0, 'cls_loss': 0.0}
@@ -243,38 +171,38 @@ class Trainer:
                     'images': images
                 }
                 
-                # Zero gradients
                 self.optimizer.zero_grad()
                 
-                # Mixed precision forward pass
+                # mixed precision 
                 if self.scaler is not None:
+                    # fwd
                     with torch.cuda.amp.autocast():
                         predictions = self.model(images)
                         loss, loss_components = self.criterion(predictions, targets)
-                    
-                    # Backward pass
+                   
+                    # bwd
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    
+                # normal w/o mixed precision
                 else:
-                    # Standard forward pass
+                    # fwd
                     predictions = self.model(images)
                     loss, loss_components = self.criterion(predictions, targets)
                     
-                    # Backward pass
+                    # bwd 
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                     self.optimizer.step()
                 
-                # Update metrics
                 total_loss += loss.item()
                 total_components['box_loss'] += loss_components[0].item()
                 total_components['obj_loss'] += loss_components[1].item()
                 total_components['cls_loss'] += loss_components[2].item()
                 
-                # Update progress bar
                 if batch_idx % 10 == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
                     pbar.set_postfix({
@@ -299,7 +227,6 @@ class Trainer:
         return avg_loss, avg_components
     
     def validate_epoch(self):
-        """Validate for one epoch"""
         self.model.eval()
         
         total_loss = 0.0
@@ -316,7 +243,7 @@ class Trainer:
                         'images': images
                     }
                     
-                    # Forward pass
+                    # fwd
                     predictions = self.model(images)
                     loss, loss_components = self.criterion(predictions, targets)
                     
@@ -362,85 +289,110 @@ class Trainer:
             torch.save(checkpoint, best_path)
             logger.info(f"Saved best model to {best_path}")
     
-    def plot_training_curves(self):
-        """Plot and save training curves"""
-        if len(self.train_losses) < 2:
-            return
+    # def load_checkpoint(self, checkpoint_path):
+
+    #     checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+    #     self.model.load_state_dict(checkpoint['model_state_dict'])
+    #     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+    #     if self.scheduler and checkpoint.get('scheduler_state_dict'):
+    #         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+    #     if self.scaler and checkpoint.get('scaler_state_dict'):
+    #         self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+    #     self.current_epoch = checkpoint.get('epoch', 0)
+    #     self.best_loss = checkpoint.get('best_loss', float('inf'))
+    #     self.best_map = checkpoint.get('best_map', 0.0)
+    #     self.train_losses = checkpoint.get('train_losses', [])
+    #     self.val_losses = checkpoint.get('val_losses', [])
+    #     self.learning_rates = checkpoint.get('learning_rates', [])
+        
+    #     logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
+    
+    # def plot_training_curves(self):
+    #     """Plot and save training curves"""
+    #     if len(self.train_losses) < 2:
+    #         return
             
-        plt.figure(figsize=(15, 10))
+    #     plt.figure(figsize=(15, 10))
         
-        # Loss curves
-        plt.subplot(2, 3, 1)
-        epochs = range(1, len(self.train_losses) + 1)
-        plt.plot(epochs, self.train_losses, 'b-', label='Training Loss', linewidth=2)
-        plt.plot(epochs, self.val_losses, 'r-', label='Validation Loss', linewidth=2)
-        plt.title('Training and Validation Loss', fontsize=14)
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+    #     # Loss curves
+    #     plt.subplot(2, 3, 1)
+    #     epochs = range(1, len(self.train_losses) + 1)
+    #     plt.plot(epochs, self.train_losses, 'b-', label='Training Loss', linewidth=2)
+    #     plt.plot(epochs, self.val_losses, 'r-', label='Validation Loss', linewidth=2)
+    #     plt.title('Training and Validation Loss', fontsize=14)
+    #     plt.xlabel('Epoch')
+    #     plt.ylabel('Loss')
+    #     plt.legend()
+    #     plt.grid(True, alpha=0.3)
         
-        # Learning rate curve
-        plt.subplot(2, 3, 2)
-        if self.learning_rates:
-            plt.plot(epochs, self.learning_rates, 'g-', linewidth=2)
-            plt.title('Learning Rate Schedule', fontsize=14)
-            plt.xlabel('Epoch')
-            plt.ylabel('Learning Rate')
-            plt.grid(True, alpha=0.3)
-            plt.yscale('log')
+    #     # Learning rate curve
+    #     plt.subplot(2, 3, 2)
+    #     if self.learning_rates:
+    #         plt.plot(epochs, self.learning_rates, 'g-', linewidth=2)
+    #         plt.title('Learning Rate Schedule', fontsize=14)
+    #         plt.xlabel('Epoch')
+    #         plt.ylabel('Learning Rate')
+    #         plt.grid(True, alpha=0.3)
+    #         plt.yscale('log')
         
-        # Training progress summary
-        plt.subplot(2, 3, 3)
-        plt.text(0.1, 0.9, f"Current Epoch: {self.current_epoch}", fontsize=12, transform=plt.gca().transAxes)
-        plt.text(0.1, 0.8, f"Best Loss: {self.best_loss:.4f}", fontsize=12, transform=plt.gca().transAxes)
-        plt.text(0.1, 0.7, f"Current LR: {self.optimizer.param_groups[0]['lr']:.6f}", fontsize=12, transform=plt.gca().transAxes)
-        plt.text(0.1, 0.5, f"Model: Multimodal PK-YOLO", fontsize=12, transform=plt.gca().transAxes)
-        plt.text(0.1, 0.4, f"Dataset: BraTS2020", fontsize=12, transform=plt.gca().transAxes)
-        plt.title('Training Summary', fontsize=14)
-        plt.axis('off')
+    #     # Training progress summary
+    #     plt.subplot(2, 3, 3)
+    #     plt.text(0.1, 0.9, f"Current Epoch: {self.current_epoch}", fontsize=12, transform=plt.gca().transAxes)
+    #     plt.text(0.1, 0.8, f"Best Loss: {self.best_loss:.4f}", fontsize=12, transform=plt.gca().transAxes)
+    #     plt.text(0.1, 0.7, f"Current LR: {self.optimizer.param_groups[0]['lr']:.6f}", fontsize=12, transform=plt.gca().transAxes)
+    #     plt.text(0.1, 0.5, f"Model: Multimodal PK-YOLO", fontsize=12, transform=plt.gca().transAxes)
+    #     plt.text(0.1, 0.4, f"Dataset: BraTS2020", fontsize=12, transform=plt.gca().transAxes)
+    #     plt.title('Training Summary', fontsize=14)
+    #     plt.axis('off')
         
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'training_curves.png', dpi=150, bbox_inches='tight')
-        plt.close()
+    #     plt.tight_layout()
+    #     plt.savefig(self.output_dir / 'training_curves.png', dpi=150, bbox_inches='tight')
+    #     plt.close()
+        
+    #     # Save loss data to CSV for external analysis
+    #     if len(self.train_losses) > 0:
+    #         import csv
+    #         csv_path = self.output_dir / 'training_history.csv'
+    #         with open(csv_path, 'w', newline='') as csvfile:
+    #             fieldnames = ['epoch', 'train_loss', 'val_loss', 'learning_rate']
+    #             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    #             writer.writeheader()
+    #             for i, (train_loss, val_loss) in enumerate(zip(self.train_losses, self.val_losses)):
+    #                 lr = self.learning_rates[i] if i < len(self.learning_rates) else None
+    #                 writer.writerow({
+    #                     'epoch': i + 1,
+    #                     'train_loss': train_loss,
+    #                     'val_loss': val_loss,
+    #                     'learning_rate': lr
+    #                 })
+    #         logger.info(f"Training history saved to {csv_path}")
     
     def train(self):
-        """Main training loop"""
         logger.info("Starting training...")
         logger.info(f"Device: {self.device}")
         logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
-        # Configuration
         num_epochs = self.config.get('training.num_epochs', 100)
         save_interval = self.config.get('logging.save_interval', 25)
-        
-        # Initialize wandb
-        use_wandb = False
-        if WANDB_AVAILABLE and self.config.get('logging.use_wandb', False):
-            wandb.init(
-                project=self.config.get('logging.wandb_project', 'multimodal-pk-yolo'),
-                name=f"pk-yolo-{int(time.time())}",
-                config=self.config.config if hasattr(self.config, 'config') else self.config,
-                dir=str(self.output_dir / 'logs')
-            )
-            use_wandb = True
-        else:
-            logger.info("Wandb logging disabled")
         
         try:
             for epoch in range(self.current_epoch, num_epochs):
                 self.current_epoch = epoch
                 epoch_start_time = time.time()
                 
-                # Training phase
+                # training 
                 train_loss, train_components = self.train_epoch()
                 self.train_losses.append(train_loss)
                 
-                # Validation phase
+                # validation 
                 val_loss, val_components = self.validate_epoch()
                 self.val_losses.append(val_loss)
                 
-                # Update learning rate
+                # update learning rate
                 current_lr = self.optimizer.param_groups[0]['lr']
                 self.learning_rates.append(current_lr)
                 
@@ -449,7 +401,6 @@ class Trainer:
                 elif self.scheduler:
                     self.scheduler.step()
                 
-                # Calculate epoch time
                 epoch_time = time.time() - epoch_start_time
                 
                 # Logging
@@ -461,40 +412,36 @@ class Trainer:
                     f"Time: {epoch_time:.1f}s"
                 )
                 
-                # Log to wandb
-                if use_wandb:
-                    metrics = {
-                        'train_loss': train_loss,
-                        'val_loss': val_loss,
-                        'learning_rate': current_lr,
-                        'epoch_time': epoch_time,
-                        **{f'train_{k}': v for k, v in train_components.items()},
-                        **{f'val_{k}': v for k, v in val_components.items()}
-                    }
-                    wandb.log(metrics, step=epoch)
+                if epoch % 10 == 0:
+                    logger.info(
+                        f"  Train Components - Box: {train_components['box_loss']:.4f}, "
+                        f"Obj: {train_components['obj_loss']:.4f}, "
+                        f"Cls: {train_components['cls_loss']:.4f}"
+                    )
+                    logger.info(
+                        f"  Val Components - Box: {val_components['box_loss']:.4f}, "
+                        f"Obj: {val_components['obj_loss']:.4f}, "
+                        f"Cls: {val_components['cls_loss']:.4f}"
+                    )
                 
-                # Save best model based on loss
                 if val_loss < self.best_loss:
                     self.best_loss = val_loss
                     self.save_checkpoint('best_model.pth', is_best=True)
                     logger.info(f"New best loss: {self.best_loss:.4f}")
                 
-                # Early stopping check
                 if self.early_stopping:
                     if self.early_stopping(val_loss, self.model):
                         logger.info(f"Early stopping triggered at epoch {epoch}")
                         break
                 
-                # Regular checkpoint saving
                 if epoch % save_interval == 0 and epoch > 0:
                     self.save_checkpoint(f'checkpoint_epoch_{epoch}.pth')
                     logger.info(f"Saved checkpoint at epoch {epoch}")
                 
-                # Plot training curves
-                if epoch % 10 == 0 or epoch == num_epochs - 1:
-                    self.plot_training_curves()
+                # # plot training curves
+                # if epoch % 10 == 0 or epoch == num_epochs - 1:
+                #     self.plot_training_curves()
                 
-                # Memory cleanup
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         
@@ -504,68 +451,80 @@ class Trainer:
             logger.error(f"Training failed with error: {e}")
             raise
         finally:
-            # Save final model
             self.save_checkpoint('final_model.pth')
             logger.info("Final model saved")
             
-            # Generate final plots
-            self.plot_training_curves()
-            
-            # Close wandb
-            if use_wandb:
-                wandb.finish()
+            # self.plot_training_curves()
             
             logger.info("Training completed successfully!")
-
-def create_default_config():
-    """Create default configuration dictionary"""
-    return {
-        'model': {
-            'num_classes': 1,
-            'input_channels': 4,
-            'img_size': 640,
-            'confidence_threshold': 0.25,
-            'nms_threshold': 0.45
-        },
-        'training': {
-            'batch_size': 4,  # Reduced for 4-channel input
-            'num_epochs': 100,
-            'learning_rate': 0.001,
-            'weight_decay': 0.0001,
-            'mixed_precision': True,
-            'early_stopping': True,
-            'patience': 20,
-            'min_delta': 0.001
-        },
-        'data': {
-            'data_dir': './data',
-            'num_workers': 4,
-            'pin_memory': True
-        },
-        'augmentation': {
-            'enabled': True,
-            'horizontal_flip': 0.5,
-            'brightness_contrast': 0.3,
-            'gamma': 0.3,
-            'noise': 0.3,
-            'random_crop_scale': [0.8, 1.0]
-        },
-        'loss': {
-            'ignore_threshold': 0.5,
-            'focal_alpha': 0.25,
-            'focal_gamma': 2.0
-        },
-        'optimizer': {
-            'type': 'AdamW',
-            'lr_scheduler': 'CosineAnnealingLR'
-        },
-        'logging': {
-            'output_dir': 'outputs',
-            'save_interval': 25,
-            'use_wandb': False,
-            'wandb_project': 'multimodal-pk-yolo'
-        }
-    }
+def create_default_config(args=None):
+   """Create default configuration dictionary with optional args override"""
+   config = {
+       'model': {
+           'num_classes': 1,
+           'input_channels': 4,
+           'img_size': 640,
+           'confidence_threshold': 0.25,
+           'nms_threshold': 0.45
+       },
+       'training': {
+           'batch_size': 4,  # Reduced for 4-channel input
+           'num_epochs': 100,
+           'learning_rate': 0.001,
+           'weight_decay': 0.0001,
+           'mixed_precision': True,
+           'early_stopping': True,
+           'patience': 20,
+           'min_delta': 0.001
+       },
+       'data': {
+           'data_dir': './data',
+           'num_workers': 4,
+           'pin_memory': True
+       },
+       'augmentation': {
+           'enabled': True,
+           'horizontal_flip': 0.5,
+           'brightness_contrast': 0.3,
+           'gamma': 0.3,
+           'noise': 0.3,
+           'random_crop_scale': [0.8, 1.0]
+       },
+       'loss': {
+           'ignore_threshold': 0.5,
+           'focal_alpha': 0.25,
+           'focal_gamma': 2.0
+       },
+       'optimizer': {
+           'type': 'AdamW',
+           'lr_scheduler': 'CosineAnnealingLR'
+       },
+       'logging': {
+           'output_dir': 'outputs',
+           'save_interval': 25
+       }
+   }
+   
+   # Override with command line arguments if provided
+   if args:
+       if args.data_dir:
+           config['data']['data_dir'] = args.data_dir
+       if args.output_dir:
+           config['logging']['output_dir'] = args.output_dir
+       if args.batch_size:
+           config['training']['batch_size'] = args.batch_size
+       if args.epochs:
+           config['training']['num_epochs'] = args.epochs
+       if args.lr:
+           config['training']['learning_rate'] = args.lr
+       if args.img_size:
+           config['model']['img_size'] = args.img_size
+       if args.workers:
+           config['data']['num_workers'] = args.workers
+       if args.mixed_precision:
+           config['training']['mixed_precision'] = True
+   
+   return config
 
 class SimpleConfig:
     """Simple configuration class"""
@@ -583,141 +542,16 @@ class SimpleConfig:
                 return default
         return value
 
-def validate_data_structure(data_dir):
-    """Validate that the data directory has the correct structure"""
-    data_path = Path(data_dir)
-    
-    if not data_path.exists():
-        raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
-    
-    # Check for required directories
-    required_dirs = ['train/images', 'train/labels']
-    
-    # Check for validation directory (either val or test)
-    if (data_path / 'val').exists():
-        required_dirs.extend(['val/images', 'val/labels'])
-        val_split = 'val'
-    elif (data_path / 'test').exists():
-        required_dirs.extend(['test/images', 'test/labels'])
-        val_split = 'test'
-    else:
-        logger.warning("No validation directory found (looking for 'val' or 'test')")
-        val_split = None
-    
-    missing_dirs = []
-    for req_dir in required_dirs:
-        if not (data_path / req_dir).exists():
-            missing_dirs.append(req_dir)
-    
-    if missing_dirs:
-        raise FileNotFoundError(f"Missing required directories: {missing_dirs}")
-    
-    # Check for training images based on your naming pattern
-    train_images_dir = data_path / 'train/images'
-    
-    # Look for BraTS pattern files
-    pattern_files = list(train_images_dir.glob('BraTS20_Training_*_t1.png'))
-    if len(pattern_files) == 0:
-        # Look for any PNG files
-        pattern_files = list(train_images_dir.glob('*.png'))
-        if len(pattern_files) == 0:
-            raise ValueError("No training images found in train/images/")
-        else:
-            logger.warning(f"Found {len(pattern_files)} images but not in expected BraTS naming pattern")
-    
-    logger.info(f"Data validation passed!")
-    logger.info(f"  Training images found: {len(pattern_files)}")
-    if val_split:
-        val_images = list((data_path / val_split / 'images').glob('*.png'))
-        logger.info(f"  Validation images: {len(val_images)} (split: {val_split})")
-    
-    return True
-
 def main():
     """Main function with argument parsing"""
-    parser = argparse.ArgumentParser(description='Train Multimodal PK-YOLO for Brain Tumor Detection')
-    
-    # Required arguments
-    parser.add_argument('--data_dir', type=str, required=True, 
-                       help='Path to dataset directory')
-    
-    # Optional configuration
-    parser.add_argument('--output_dir', type=str, default='outputs', 
-                       help='Output directory for logs and checkpoints')
-    
-    # Training parameters
-    parser.add_argument('--batch_size', type=int, default=4,
-                       help='Batch size')
-    parser.add_argument('--epochs', type=int, default=100,
-                       help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=0.001,
-                       help='Learning rate')
-    parser.add_argument('--img_size', type=int, default=640,
-                       help='Input image size')
-    
-    # Hardware settings
-    parser.add_argument('--workers', type=int, default=4,
-                       help='Number of data loader workers')
-    parser.add_argument('--mixed_precision', action='store_true',
-                       help='Enable mixed precision training')
-    
-    # Training control
-    parser.add_argument('--resume', type=str, 
-                       help='Path to checkpoint to resume from')
-    parser.add_argument('--validate_data', action='store_true',
-                       help='Validate data structure and exit')
-    
-    # Logging and monitoring
-    parser.add_argument('--wandb', action='store_true', 
-                       help='Enable wandb logging')
-    parser.add_argument('--project', type=str, default='multimodal-pk-yolo', 
-                       help='Wandb project name')
+    parser = get_train_arg_parser()
     
     args = parser.parse_args()
     
-    # Handle data validation
-    if args.validate_data:
-        try:
-            validate_data_structure(args.data_dir)
-            print("✅ Data structure validation passed!")
-        except Exception as e:
-            print(f"❌ Data structure validation failed: {e}")
-        return
-    
-    # Load configuration
-    config_dict = create_default_config()
+    # config file + override with args input
+    config_dict = create_default_config(args)
     config = SimpleConfig(config_dict)
     
-    # Override config with command line arguments
-    if args.data_dir:
-        config.config['data']['data_dir'] = args.data_dir
-    if args.output_dir:
-        config.config['logging']['output_dir'] = args.output_dir
-    if args.batch_size:
-        config.config['training']['batch_size'] = args.batch_size
-    if args.epochs:
-        config.config['training']['num_epochs'] = args.epochs
-    if args.lr:
-        config.config['training']['learning_rate'] = args.lr
-    if args.img_size:
-        config.config['model']['img_size'] = args.img_size
-    if args.workers:
-        config.config['data']['num_workers'] = args.workers
-    if args.mixed_precision:
-        config.config['training']['mixed_precision'] = True
-    if args.wandb:
-        config.config['logging']['use_wandb'] = True
-        config.config['logging']['wandb_project'] = args.project
-    
-    # Validate data directory
-    try:
-        validate_data_structure(args.data_dir)
-    except Exception as e:
-        logger.error(f"Data validation failed: {e}")
-        logger.info("Use --validate_data to check your data structure")
-        return
-    
-    # Print configuration summary
     logger.info("=" * 60)
     logger.info("MULTIMODAL PK-YOLO TRAINING")
     logger.info("=" * 60)
@@ -729,16 +563,13 @@ def main():
     logger.info(f"  Image size: {config.get('model.img_size')}")
     logger.info(f"  Mixed precision: {config.get('training.mixed_precision')}")
     logger.info(f"  Early stopping: {config.get('training.early_stopping')}")
-    logger.info(f"  Wandb logging: {config.get('logging.use_wandb')}")
     logger.info("=" * 60)
     
-    # Initialize trainer
     try:
         trainer = Trainer(config)
         trainer.load_datasets()
     except Exception as e:
         logger.error(f"Failed to initialize trainer: {e}")
-        logger.error("Check your data directory structure and configuration")
         return
     
     # Resume from checkpoint if specified
@@ -750,14 +581,14 @@ def main():
             logger.error(f"Checkpoint file not found: {args.resume}")
             return
     
-    # Start training
     try:
         logger.info("Starting training process...")
         trainer.train()
-        logger.info("🎉 Training completed successfully!")
-        logger.info(f"📊 Best validation loss: {trainer.best_loss:.4f}")
-        logger.info(f"💾 Models saved in: {trainer.output_dir / 'checkpoints'}")
-        logger.info(f"📋 Training curves: {trainer.output_dir / 'training_curves.png'}")
+        logger.info("[SUCCESS] Training completed successfully!")
+        logger.info(f"[RESULTS] Best validation loss: {trainer.best_loss:.4f}")
+        logger.info(f"[OUTPUT] Models saved in: {trainer.output_dir / 'checkpoints'}")
+        logger.info(f"[PLOTS] Training curves: {trainer.output_dir / 'training_curves.png'}")
+        logger.info(f"[DATA] Training history: {trainer.output_dir / 'training_history.csv'}")
         
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
@@ -768,7 +599,6 @@ def main():
         raise
 
 if __name__ == "__main__":
-    # Set multiprocessing start method for compatibility
     try:
         import multiprocessing
         multiprocessing.set_start_method('spawn', force=True)

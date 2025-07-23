@@ -1,12 +1,11 @@
-import os
-import shutil
+
 import nibabel as nib
 import numpy as np
 import cv2
 from pathlib import Path
 import json
 import argparse
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple
 import logging
 from tqdm import tqdm
 import matplotlib
@@ -669,99 +668,50 @@ class DataAugmentationAnalyzer:
 
 def main():
     parser = argparse.ArgumentParser(description='BraTS Dataset Processing Utilities')
-    parser.add_argument('--action', choices=['convert', 'convert_presplit', 'analyze', 'validate', 'visualize', 'augment', 'detect'], 
-                       required=True, help='Action to perform')
     parser.add_argument('--input_dir', type=str, help='Input directory (for convert actions)')
-    parser.add_argument('--data_dir', type=str, help='Data directory (for other actions)')
-    parser.add_argument('--slice_id', type=str, help='Slice ID (for visualize/augment actions)')
     parser.add_argument('--output_dir', type=str, help='Output directory (for convert actions)')
     parser.add_argument('--img_size', type=int, default=640, help='Image size for processing')
     parser.add_argument('--slice_range', type=int, nargs=2, default=[50, 130], help='Slice range [start, end]')
     
     args = parser.parse_args()
     
-    if args.action == 'detect':
-        if not args.input_dir:
-            print("Error: --input_dir required for detect action")
-            return
-        is_presplit = detect_dataset_structure(args.input_dir)
-        print(f"Dataset structure: {'Pre-split' if is_presplit else 'Raw BraTS format'}")
-        if is_presplit:
-            print("Use --action convert_presplit")
-        else:
-            print("Use --action convert")
+    if not args.input_dir or not args.output_dir:
+        print("Error: --input_dir and --output_dir required for convert action")
+        return
     
-    elif args.action == 'convert':
-        if not args.input_dir or not args.output_dir:
-            print("Error: --input_dir and --output_dir required for convert action")
-            return
-        
-        is_presplit = detect_dataset_structure(args.input_dir)
-        
-        processor = BraTSDataProcessor(
-            args.input_dir, 
-            args.output_dir,
-            img_size=args.img_size,
-            slice_range=tuple(args.slice_range),
-            pre_split=is_presplit
-        )
-        stats = processor.process_dataset()
-        
-        create_data_yaml(args.output_dir)
-        analyze_dataset_statistics(args.output_dir)
-        validate_dataset(args.output_dir)
-        
-        print(f"\nConversion complete! Stats: {stats}")
+    is_presplit = detect_dataset_structure(args.input_dir)
     
-    elif args.action == 'convert_presplit':
-        if not args.input_dir or not args.output_dir:
-            print("Error: --input_dir and --output_dir required for convert_presplit action")
-            return
-        
-        stats = convert_presplit_brats(args.input_dir, args.output_dir)
-        print(f"Pre-split conversion complete! Stats: {stats}")
+    processor = BraTSDataProcessor(
+        args.input_dir, 
+        args.output_dir,
+        img_size=args.img_size,
+        slice_range=tuple(args.slice_range),
+        pre_split=is_presplit
+    )
+    stats = processor.process_dataset()
     
-    elif args.action == 'analyze':
-        if not args.data_dir:
-            print("Error: --data_dir required for analyze action")
-            return
-        analyze_dataset_statistics(args.data_dir)
+    create_data_yaml(args.output_dir)
+    analyze_dataset_statistics(args.output_dir)
+    validate_dataset(args.output_dir)
     
-    elif args.action == 'validate':
-        if not args.data_dir:
-            print("Error: --data_dir required for validate action")
-            return
-        validate_dataset(args.data_dir)
+    print(f"\nConversion complete! Stats: {stats}")
     
-    elif args.action == 'visualize':
-        if not args.data_dir or not args.slice_id:
-            print("Error: --data_dir and --slice_id required for visualize action")
-            return
-        visualize_multimodal_slice(args.data_dir + "/train", args.slice_id)
-    
-    elif args.action == 'augment':
-        if not args.data_dir or not args.slice_id:
-            print("Error: --data_dir and --slice_id required for augment action")
-            return
-        analyzer = DataAugmentationAnalyzer(args.data_dir)
-        analyzer.visualize_augmentations(args.slice_id)
-
 if __name__ == "__main__":
     import sys
     if len(sys.argv) == 1:
         print("BraTS Dataset Processing Utilities")
         print("\nUsage examples:")
         print("1. Detect dataset structure:")
-        print("   python data_utils.py --action detect --input_dir /path/to/BraTS2020")
+        print("   python data_utils.py --action detect --input_dir .data/")
         print("\n2. Convert raw BraTS to YOLO format (auto-detects structure):")
-        print("   python data_utils.py --action convert --input_dir /path/to/BraTS2020 --output_dir /path/to/output")
+        print("   python data_utils.py --action convert --input_dir Brats_Dataset2020/ --output_dir .data/")
         print("\n3. Convert pre-split BraTS to YOLO format:")
-        print("   python data_utils.py --action convert_presplit --input_dir /path/to/BraTS2020_TrainingData --output_dir /path/to/output")
+        print("   python data_utils.py --action convert_presplit --input_dir .data/ --output_dir /path/to/output")
         print("\n4. Analyze dataset statistics:")
-        print("   python data_utils.py --action analyze --data_dir /path/to/processed_data")
+        print("   python data_utils.py --action analyze --data_dir .data/")
         print("\n5. Validate dataset:")
-        print("   python data_utils.py --action validate --data_dir /path/to/processed_data")
-        print("\n6. Visualize a slice:")
-        print("   python data_utils.py --action visualize --data_dir /path/to/processed_data --slice_id BraTS20_Training_002_slice_029")
+        print("   python data_utils.py --action validate --data_dir .data/") 
+        print("\n6. Visualize a slice:") 
+        print("   python data_utils.py --action visualize --data_dir .data/ --slice_id BraTS20_Training_002_slice_029")
     else:
         main()

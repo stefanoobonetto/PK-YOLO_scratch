@@ -1,21 +1,14 @@
-# Convert BraTS NIfTI files to YOLO format
-python data_utils.py --action convert --input_dir C:\Users\stefano.bonetto\PK-YOLO_scratch\BraTS2020_TrainingData --output_dir ./data
-
-# Validate dataset
-python data_utils.py --action validate --data_dir ./data
-
-# Analyze statistics
-python data_utils.py --action analyze --data_dir ./data
-
-
+Conversion of dataset:
+    python data_utils.py --input_dir C:\Users\stefano.bonetto\PK-YOLO_scratch\BraTS2020_TrainingData --output_dir ./data
+    -->  just extracted slices from 50 to 130 due to computational checkpoints 
 
 TRAINING
+    python training_script.py --data_dir ./data --batch_size 1 --epochs 10 --lr 0.001
 
-# Basic training
-python training_script.py --data_dir ./data
 
-# Advanced training with custom parameters
-python training_script.py --data_dir ./data --batch_size 16 --epochs 200 --lr 0.0005
+--> anchor or asto predendo quelli predefiniti di COCO, si potrebbe utilizzare KMeans per tirare fuori anchors ad hoc per BraTS2020
 
-# Resume from checkpoint
-python training_script.py --data_dir ./data --resume ./outputs/checkpoints/best_model.pth
+--> utilizzare la funziona autobalance è utile se vediamo problemi di convergenza
+    brain gliomas hanno pattern diversi da COCO, ma i pesi fissi sono più stabili per iniziare.
+    in caso si decidesse di utilizzarlo, bisognerebbe implementare la funzione
+    
