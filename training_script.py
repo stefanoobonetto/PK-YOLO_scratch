@@ -13,6 +13,7 @@ from utils.utils import get_train_arg_parser
 from utils.early_stopping import EarlyStopping
 from multimodal_pk_yolo import MultimodalPKYOLO
 from brats_dataset import BraTSDataset, collate_fn
+from visualization import TrainingVisualizer
 
 warnings.filterwarnings('ignore')
 
@@ -38,7 +39,7 @@ class Trainer:
             autobalance=True
         )
         
-        # optimizer setup
+        # optimizer setup
         optimizer_type = self.config.get('optimizer.type', 'AdamW')
         lr = self.config.get('training.learning_rate', 1e-3)
         weight_decay = self.config.get('training.weight_decay', 1e-4)
@@ -93,6 +94,14 @@ class Trainer:
                 self.scaler = torch.cuda.amp.GradScaler()
             except:
                 self.scaler = None
+        
+        # Visualization setup
+        self.visualizer = TrainingVisualizer(
+            output_dir=str(self.output_dir),
+            save_interval=self.config.get('visualization.save_interval', 100)
+        )
+        
+        logger.info(f"🎨 Training visualizer initialized - saving every {self.config.get('visualization.save_interval', 100)} batches")
                 
     def load_datasets(self):
         
@@ -203,6 +212,22 @@ class Trainer:
                 total_components['obj_loss'] += loss_components[1].item()
                 total_components['cls_loss'] += loss_components[2].item()
                 
+                # 🎨 VISUALIZATION: Save training visualization every N batches
+                if self.visualizer.should_save(batch_idx):
+                    # Get slice IDs from batch
+                    slice_ids = batch.get('slice_ids', [f'batch_{batch_idx}_sample_{i}' for i in range(len(images))])
+                    
+                    logger.info(f"📸 Creating visualization for epoch {self.current_epoch}, batch {batch_idx}")
+                    # Save visualization with predictions
+                    self.visualizer.update_batch_count(
+                        batch_idx=batch_idx,
+                        epoch=self.current_epoch,
+                        images=images,
+                        targets=targets,
+                        predictions=predictions,
+                        slice_ids=slice_ids
+                    )
+                
                 if batch_idx % 10 == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
                     pbar.set_postfix({
@@ -234,7 +259,7 @@ class Trainer:
         num_batches = len(self.val_loader)
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc='Validation'):
+            for batch_idx, batch in enumerate(tqdm(self.val_loader, desc='Validation')):
                 try:
                     images = batch['images'].to(self.device, dtype=torch.float32, non_blocking=True)
                     targets = {
@@ -251,6 +276,28 @@ class Trainer:
                     total_components['box_loss'] += loss_components[0].item()
                     total_components['obj_loss'] += loss_components[1].item()
                     total_components['cls_loss'] += loss_components[2].item()
+                    
+                    # 🎨 VALIDATION VISUALIZATION: Save occasional validation visualizations
+                    if batch_idx == 0 and self.current_epoch % 5 == 0:  # First validation batch every 5 epochs
+                        slice_ids = batch.get('slice_ids', [f'val_batch_{batch_idx}_sample_{i}' for i in range(len(images))])
+                        
+                        logger.info(f"📸 Creating validation visualization for epoch {self.current_epoch}")
+                        # Save to a different directory for validation
+                        val_vis_dir = self.output_dir / 'validation_visualizations'
+                        val_vis_dir.mkdir(exist_ok=True)
+                        
+                        # Create temporary visualizer for validation
+                        val_visualizer = TrainingVisualizer(str(self.output_dir), save_interval=1)
+                        val_visualizer.vis_dir = val_vis_dir
+                        
+                        val_visualizer.save_training_visualization(
+                            batch_idx=batch_idx,
+                            epoch=self.current_epoch,
+                            images=images,
+                            targets=targets,
+                            predictions=predictions,
+                            slice_ids=slice_ids
+                        )
                 
                 except RuntimeError as e:
                     if "out of memory" in str(e):
@@ -289,92 +336,11 @@ class Trainer:
             torch.save(checkpoint, best_path)
             logger.info(f"Saved best model to {best_path}")
     
-    # def load_checkpoint(self, checkpoint_path):
-
-    #     checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-    #     self.model.load_state_dict(checkpoint['model_state_dict'])
-    #     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-    #     if self.scheduler and checkpoint.get('scheduler_state_dict'):
-    #         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-    #     if self.scaler and checkpoint.get('scaler_state_dict'):
-    #         self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        
-    #     self.current_epoch = checkpoint.get('epoch', 0)
-    #     self.best_loss = checkpoint.get('best_loss', float('inf'))
-    #     self.best_map = checkpoint.get('best_map', 0.0)
-    #     self.train_losses = checkpoint.get('train_losses', [])
-    #     self.val_losses = checkpoint.get('val_losses', [])
-    #     self.learning_rates = checkpoint.get('learning_rates', [])
-        
-    #     logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
-    
-    # def plot_training_curves(self):
-    #     """Plot and save training curves"""
-    #     if len(self.train_losses) < 2:
-    #         return
-            
-    #     plt.figure(figsize=(15, 10))
-        
-    #     # Loss curves
-    #     plt.subplot(2, 3, 1)
-    #     epochs = range(1, len(self.train_losses) + 1)
-    #     plt.plot(epochs, self.train_losses, 'b-', label='Training Loss', linewidth=2)
-    #     plt.plot(epochs, self.val_losses, 'r-', label='Validation Loss', linewidth=2)
-    #     plt.title('Training and Validation Loss', fontsize=14)
-    #     plt.xlabel('Epoch')
-    #     plt.ylabel('Loss')
-    #     plt.legend()
-    #     plt.grid(True, alpha=0.3)
-        
-    #     # Learning rate curve
-    #     plt.subplot(2, 3, 2)
-    #     if self.learning_rates:
-    #         plt.plot(epochs, self.learning_rates, 'g-', linewidth=2)
-    #         plt.title('Learning Rate Schedule', fontsize=14)
-    #         plt.xlabel('Epoch')
-    #         plt.ylabel('Learning Rate')
-    #         plt.grid(True, alpha=0.3)
-    #         plt.yscale('log')
-        
-    #     # Training progress summary
-    #     plt.subplot(2, 3, 3)
-    #     plt.text(0.1, 0.9, f"Current Epoch: {self.current_epoch}", fontsize=12, transform=plt.gca().transAxes)
-    #     plt.text(0.1, 0.8, f"Best Loss: {self.best_loss:.4f}", fontsize=12, transform=plt.gca().transAxes)
-    #     plt.text(0.1, 0.7, f"Current LR: {self.optimizer.param_groups[0]['lr']:.6f}", fontsize=12, transform=plt.gca().transAxes)
-    #     plt.text(0.1, 0.5, f"Model: Multimodal PK-YOLO", fontsize=12, transform=plt.gca().transAxes)
-    #     plt.text(0.1, 0.4, f"Dataset: BraTS2020", fontsize=12, transform=plt.gca().transAxes)
-    #     plt.title('Training Summary', fontsize=14)
-    #     plt.axis('off')
-        
-    #     plt.tight_layout()
-    #     plt.savefig(self.output_dir / 'training_curves.png', dpi=150, bbox_inches='tight')
-    #     plt.close()
-        
-    #     # Save loss data to CSV for external analysis
-    #     if len(self.train_losses) > 0:
-    #         import csv
-    #         csv_path = self.output_dir / 'training_history.csv'
-    #         with open(csv_path, 'w', newline='') as csvfile:
-    #             fieldnames = ['epoch', 'train_loss', 'val_loss', 'learning_rate']
-    #             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-    #             writer.writeheader()
-    #             for i, (train_loss, val_loss) in enumerate(zip(self.train_losses, self.val_losses)):
-    #                 lr = self.learning_rates[i] if i < len(self.learning_rates) else None
-    #                 writer.writerow({
-    #                     'epoch': i + 1,
-    #                     'train_loss': train_loss,
-    #                     'val_loss': val_loss,
-    #                     'learning_rate': lr
-    #                 })
-    #         logger.info(f"Training history saved to {csv_path}")
-    
     def train(self):
         logger.info("Starting training...")
         logger.info(f"Device: {self.device}")
         logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        logger.info(f"🎨 Visualizations will be saved to: {self.output_dir / 'training_visualizations'}")
         
         num_epochs = self.config.get('training.num_epochs', 100)
         save_interval = self.config.get('logging.save_interval', 25)
@@ -438,10 +404,6 @@ class Trainer:
                     self.save_checkpoint(f'checkpoint_epoch_{epoch}.pth')
                     logger.info(f"Saved checkpoint at epoch {epoch}")
                 
-                # # plot training curves
-                # if epoch % 10 == 0 or epoch == num_epochs - 1:
-                #     self.plot_training_curves()
-                
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         
@@ -454,9 +416,13 @@ class Trainer:
             self.save_checkpoint('final_model.pth')
             logger.info("Final model saved")
             
-            # self.plot_training_curves()
+            # Log visualization summary
+            total_visualizations = self.visualizer.batch_count // self.visualizer.save_interval
+            logger.info(f"🎨 Training completed! Created {total_visualizations} training visualizations")
+            logger.info(f"📁 Visualizations saved in: {self.output_dir / 'training_visualizations'}")
             
             logger.info("Training completed successfully!")
+
 def create_default_config(args=None):
    """Create default configuration dictionary with optional args override"""
    config = {
@@ -502,6 +468,13 @@ def create_default_config(args=None):
        'logging': {
            'output_dir': 'outputs',
            'save_interval': 25
+       },
+       'visualization': {
+           'save_interval': 100,          # Save visualization every 100 batches
+           'modality_for_display': 1,     # 0=T1, 1=T1ce, 2=T2, 3=FLAIR
+           'confidence_threshold': 0.1,   # Lower threshold to see more predictions
+           'max_predictions_display': 10, # Maximum predictions to show
+           'save_validation_vis': True    # Save validation visualizations too
        }
    }
    
@@ -546,15 +519,28 @@ def main():
     """Main function with argument parsing"""
     parser = get_train_arg_parser()
     
+    # Add visualization-specific arguments
+    parser.add_argument('--vis_interval', type=int, default=20, 
+                       help='Save visualization every N batches')
+    parser.add_argument('--vis_modality', type=int, default=1, choices=[0,1,2,3],
+                       help='Modality to use for visualization (0=T1, 1=T1ce, 2=T2, 3=FLAIR)')
+    
     args = parser.parse_args()
     
     # config file + override with args input
     config_dict = create_default_config(args)
+    
+    # Override visualization settings from args
+    if args.vis_interval:
+        config_dict['visualization']['save_interval'] = args.vis_interval
+    if args.vis_modality is not None:
+        config_dict['visualization']['modality_for_display'] = args.vis_modality
+    
     config = SimpleConfig(config_dict)
     
-    logger.info("=" * 60)
-    logger.info("MULTIMODAL PK-YOLO TRAINING")
-    logger.info("=" * 60)
+    logger.info("=" * 70)
+    logger.info("🧠 MULTIMODAL PK-YOLO TRAINING WITH VISUALIZATION 🎨")
+    logger.info("=" * 70)
     logger.info(f"  Data directory: {config.get('data.data_dir')}")
     logger.info(f"  Output directory: {config.get('logging.output_dir')}")
     logger.info(f"  Batch size: {config.get('training.batch_size')}")
@@ -563,7 +549,11 @@ def main():
     logger.info(f"  Image size: {config.get('model.img_size')}")
     logger.info(f"  Mixed precision: {config.get('training.mixed_precision')}")
     logger.info(f"  Early stopping: {config.get('training.early_stopping')}")
-    logger.info("=" * 60)
+    logger.info("  " + "-" * 66)
+    logger.info(f"🎨 Visualization interval: every {config.get('visualization.save_interval')} batches")
+    logger.info(f"🧠 Display modality: {['T1', 'T1ce', 'T2', 'FLAIR'][config.get('visualization.modality_for_display')]}")
+    logger.info(f"🎯 Confidence threshold: {config.get('visualization.confidence_threshold')}")
+    logger.info("=" * 70)
     
     try:
         trainer = Trainer(config)
@@ -575,20 +565,20 @@ def main():
     # Resume from checkpoint if specified
     if args.resume:
         if Path(args.resume).exists():
-            trainer.load_checkpoint(args.resume)
-            logger.info(f"Resumed from checkpoint: {args.resume}")
+            # Note: load_checkpoint method would need to be implemented
+            logger.info(f"Resume functionality not implemented yet: {args.resume}")
         else:
             logger.error(f"Checkpoint file not found: {args.resume}")
             return
     
     try:
-        logger.info("Starting training process...")
+        logger.info("🚀 Starting training process...")
         trainer.train()
-        logger.info("[SUCCESS] Training completed successfully!")
-        logger.info(f"[RESULTS] Best validation loss: {trainer.best_loss:.4f}")
-        logger.info(f"[OUTPUT] Models saved in: {trainer.output_dir / 'checkpoints'}")
-        logger.info(f"[PLOTS] Training curves: {trainer.output_dir / 'training_curves.png'}")
-        logger.info(f"[DATA] Training history: {trainer.output_dir / 'training_history.csv'}")
+        logger.info("✅ [SUCCESS] Training completed successfully!")
+        logger.info(f"📊 [RESULTS] Best validation loss: {trainer.best_loss:.4f}")
+        logger.info(f"💾 [OUTPUT] Models saved in: {trainer.output_dir / 'checkpoints'}")
+        logger.info(f"🎨 [VISUALS] Training visualizations: {trainer.output_dir / 'training_visualizations'}")
+        logger.info(f"🔍 [VALIDATION] Validation visualizations: {trainer.output_dir / 'validation_visualizations'}")
         
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
