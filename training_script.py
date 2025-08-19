@@ -6,6 +6,10 @@ from tqdm import tqdm
 from pathlib import Path
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import numpy as np
 
 # utils
 from complete_yolo_loss import YOLOLoss
@@ -13,16 +17,175 @@ from utils.utils import get_train_arg_parser
 from utils.early_stopping import EarlyStopping
 from multimodal_pk_yolo import MultimodalPKYOLO
 from brats_dataset import BraTSDataset, collate_fn
-from visualization import DebugVisualizer
 
 warnings.filterwarnings('ignore')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+class SimpleVisualizer:
+    """Simple visualization class"""
+    def __init__(self, output_dir: str, save_interval: int = 100):
+        self.vis_dir = Path(output_dir) / 'training_visualizations'
+        self.vis_dir.mkdir(parents=True, exist_ok=True)
+        self.save_interval = save_interval
+        self.batch_count = 0
+        logger.info(f"🎨 Visualizer ready: {self.vis_dir}")
+    
+    def should_save(self, batch_idx: int) -> bool:
+        return batch_idx % self.save_interval == 0
+    
+    def decode_predictions(self, predictions, img_size=640, conf_thresh=0.1):
+        """Decode YOLO predictions to bounding boxes"""
+        detections = []
+        
+        # Anchors for each scale
+        anchors = [
+            [[10, 13], [16, 30], [33, 23]],      # P3/8
+            [[30, 61], [62, 45], [59, 119]],     # P4/16  
+            [[116, 90], [156, 198], [373, 326]]  # P5/32
+        ]
+        strides = [8, 16, 32]
+        
+        for scale_idx, (cls_score, bbox_pred, objectness) in enumerate(predictions):
+            if scale_idx >= len(anchors):
+                continue
+                
+            batch_size, _, h, w = cls_score.shape
+            stride = strides[scale_idx]
+            scale_anchors = torch.tensor(anchors[scale_idx], device=cls_score.device)
+            
+            # Reshape predictions
+            num_anchors = 3
+            cls_score = cls_score.view(batch_size, num_anchors, 1, h, w).permute(0, 1, 3, 4, 2)
+            bbox_pred = bbox_pred.view(batch_size, num_anchors, 4, h, w).permute(0, 1, 3, 4, 2)
+            objectness = objectness.view(batch_size, num_anchors, h, w)
+            
+            # Apply sigmoid
+            cls_prob = torch.sigmoid(cls_score)
+            obj_prob = torch.sigmoid(objectness)
+            
+            # Process first image in batch only
+            for a in range(num_anchors):
+                for i in range(h):
+                    for j in range(w):
+                        obj_conf = obj_prob[0, a, i, j].item()
+                        
+                        if obj_conf > conf_thresh:
+                            cls_conf = cls_prob[0, a, i, j, 0].item()
+                            total_conf = obj_conf * cls_conf
+                            
+                            if total_conf > conf_thresh:
+                                # Decode bounding box
+                                bbox = bbox_pred[0, a, i, j]
+                                
+                                # Apply sigmoid and scale
+                                xy = torch.sigmoid(bbox[0:2]) * 2.0 - 0.5
+                                wh = (torch.sigmoid(bbox[2:4]) * 2) ** 2 * scale_anchors[a]
+                                
+                                # Convert to image coordinates
+                                x_center = (xy[0] + j) * stride / img_size
+                                y_center = (xy[1] + i) * stride / img_size
+                                width = wh[0] / img_size
+                                height = wh[1] / img_size
+                                
+                                detections.append({
+                                    'bbox': [x_center.item(), y_center.item(), width.item(), height.item()],
+                                    'confidence': total_conf
+                                })
+        
+        return detections
+    
+    def save_visualization(self, batch_idx: int, epoch: int, images: torch.Tensor, targets: dict, predictions, slice_ids: list):
+        """Save visualization with both GT and predictions"""
+        try:
+            # Set matplotlib to non-interactive mode
+            plt.ioff()
+            
+            # Take first image, T1ce channel
+            img = images[0, 1].detach().cpu().numpy()
+            img = (img - img.min()) / (img.max() - img.min()) * 255
+            img = img.astype(np.uint8)
+            
+            # Get GT boxes
+            gt_boxes = targets['bboxes'][0].detach().cpu().numpy()
+            gt_labels = targets['labels'][0].detach().cpu().numpy()
+            
+            # Decode predictions
+            pred_boxes = self.decode_predictions(predictions, img_size=img.shape[0])
+            
+            fig, ax = plt.subplots(figsize=(10, 10))
+            ax.imshow(img, cmap='gray')
+            
+            h, w = img.shape
+            
+            # Draw GT boxes (GREEN)
+            gt_count = 0
+            for box, label in zip(gt_boxes, gt_labels):
+                if label >= 0:
+                    x_center, y_center, width, height = box
+                    x1 = (x_center - width/2) * w
+                    y1 = (y_center - height/2) * h
+                    w_box = width * w
+                    h_box = height * h
+                    
+                    rect = plt.Rectangle((x1, y1), w_box, h_box, 
+                                       fill=False, color='lime', linewidth=3, alpha=0.8)
+                    ax.add_patch(rect)
+                    
+                    # Add GT label
+                    ax.text(x1, y1-5, 'GT', fontsize=10, color='lime', weight='bold',
+                           bbox=dict(boxstyle="round,pad=0.3", facecolor='lime', alpha=0.7))
+                    gt_count += 1
+            
+            # Draw prediction boxes (RED)
+            pred_count = 0
+            for pred in pred_boxes[:10]:  # Show max 10 predictions
+                x_center, y_center, width, height = pred['bbox']
+                confidence = pred['confidence']
+                
+                x1 = (x_center - width/2) * w
+                y1 = (y_center - height/2) * h
+                w_box = width * w
+                h_box = height * h
+                
+                rect = plt.Rectangle((x1, y1), w_box, h_box, 
+                                   fill=False, color='red', linewidth=2, alpha=0.8)
+                ax.add_patch(rect)
+                
+                # Add prediction label with confidence
+                ax.text(x1, y1-25, f'P:{confidence:.2f}', fontsize=9, color='red', weight='bold',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor='red', alpha=0.7))
+                pred_count += 1
+            
+            # Add legend and title
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0], [0], color='lime', lw=3, label=f'Ground Truth ({gt_count})'),
+                Line2D([0], [0], color='red', lw=2, label=f'Predictions ({pred_count})')
+            ]
+            ax.legend(handles=legend_elements, loc='upper right', fontsize=12)
+            
+            ax.set_title(f'Epoch {epoch}, Batch {batch_idx} | GT: {gt_count}, Pred: {pred_count}', 
+                        fontsize=14, weight='bold')
+            ax.axis('off')
+            
+            filename = f'epoch_{epoch:03d}_batch_{batch_idx:04d}_gt{gt_count}_pred{pred_count}.png'
+            save_path = self.vis_dir / filename
+            fig.savefig(save_path, bbox_inches='tight', dpi=100)
+            plt.close(fig)
+            
+            logger.info(f"✅ Saved visualization: {filename} | GT: {gt_count}, Pred: {pred_count}")
+            self.batch_count += 1
+            
+        except Exception as e:
+            logger.error(f"❌ Visualization error: {e}")
+            import traceback
+            traceback.print_exc()
+            pass
+
 class Trainer:    
     def __init__(self, config):
-        
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
                 
@@ -76,7 +239,6 @@ class Trainer:
         
         (self.output_dir / 'checkpoints').mkdir(exist_ok=True)
         (self.output_dir / 'logs').mkdir(exist_ok=True)
-        (self.output_dir / 'visualizations').mkdir(exist_ok=True)
         
         # early stopping 
         if self.config.get('training.early_stopping', True):
@@ -95,14 +257,13 @@ class Trainer:
             except:
                 self.scaler = None
         
-        # Visualization setup
-        self.debug_vis = DebugVisualizer(str(self.output_dir), save_interval=100)
-    
-        
-        logger.info(f"🎨 Training visualizer initialized - saving every {self.config.get('visualization.save_interval', 100)} batches")
+        # VISUALIZATION SETUP - THIS WAS MISSING!
+        self.visualizer = SimpleVisualizer(
+            output_dir=str(self.output_dir),
+            save_interval=self.config.get('visualization.save_interval', 100)
+        )
                 
     def load_datasets(self):
-        
         data_dir = self.config.get('data.data_dir', './data')
         img_size = self.config.get('model.img_size', 640)
         batch_size = self.config.get('training.batch_size', 8)
@@ -119,10 +280,8 @@ class Trainer:
         
         # Use val if exists, otherwise use test
         if val_dir.exists():
-            val_split_dir = val_dir
             val_split_name = 'val'
         elif test_dir.exists():
-            val_split_dir = test_dir
             val_split_name = 'test'
         else:
             raise FileNotFoundError(f"Neither val nor test directory found in {data_dir}")
@@ -138,7 +297,7 @@ class Trainer:
         self.train_loader = DataLoader(
             self.train_dataset, batch_size=batch_size, shuffle=True,
             collate_fn=collate_fn, num_workers=num_workers, pin_memory=pin_memory,
-            drop_last=True  # For stable batch norm
+            drop_last=True
         )
         
         # Validation dataset
@@ -153,13 +312,9 @@ class Trainer:
         
         logger.info(f"Loaded {len(self.train_dataset)} training samples")
         logger.info(f"Loaded {len(self.val_dataset)} validation samples")
-        logger.info(f"Training batches: {len(self.train_loader)}")
-        logger.info(f"Validation batches: {len(self.val_loader)}")
         
         if len(self.train_dataset) == 0:
-            raise ValueError("Training dataset is empty! Check your data preprocessing.")
-        if len(self.val_dataset) == 0:
-            logger.warning("Validation dataset is empty!")
+            raise ValueError("Training dataset is empty!")
     
     def train_epoch(self):
         self.model.train()
@@ -180,29 +335,21 @@ class Trainer:
                 
                 self.optimizer.zero_grad()
                 
-                # mixed precision 
+                # Forward pass
                 if self.scaler is not None:
-                    # fwd
                     with torch.cuda.amp.autocast():
                         predictions = self.model(images)
                         loss, loss_components = self.criterion(predictions, targets)
-                   
-                    # bwd
+                    
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                    
-                # normal w/o mixed precision
                 else:
-                    # fwd
                     predictions = self.model(images)
                     loss, loss_components = self.criterion(predictions, targets)
-                                        
-                    self.debug_vis.save_batch_debug(batch_idx, self.current_epoch, images, targets)
                     
-                    # bwd 
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                     self.optimizer.step()
@@ -212,20 +359,11 @@ class Trainer:
                 total_components['obj_loss'] += loss_components[1].item()
                 total_components['cls_loss'] += loss_components[2].item()
                 
-                # 🎨 VISUALIZATION: Save training visualization every N batches
+                # VISUALIZATION
                 if self.visualizer.should_save(batch_idx):
-                    # Get slice IDs from batch
-                    slice_ids = batch.get('slice_ids', [f'batch_{batch_idx}_sample_{i}' for i in range(len(images))])
-                    
-                    logger.info(f"📸 Creating visualization for epoch {self.current_epoch}, batch {batch_idx}")
-                    # Save visualization with predictions
-                    self.visualizer.update_batch_count(
-                        batch_idx=batch_idx,
-                        epoch=self.current_epoch,
-                        images=images,
-                        targets=targets,
-                        predictions=predictions,
-                        slice_ids=slice_ids
+                    slice_ids = batch.get('slice_ids', [f'batch_{batch_idx}'])
+                    self.visualizer.save_visualization(
+                        batch_idx, self.current_epoch, images, targets, predictions, slice_ids
                     )
                 
                 if batch_idx % 10 == 0:
@@ -240,7 +378,7 @@ class Trainer:
             
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    logger.error(f"CUDA OOM at batch {batch_idx}. Clearing cache and skipping batch.")
+                    logger.error(f"CUDA OOM at batch {batch_idx}")
                     torch.cuda.empty_cache()
                     continue
                 else:
@@ -259,7 +397,7 @@ class Trainer:
         num_batches = len(self.val_loader)
         
         with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(self.val_loader, desc='Validation')):
+            for batch in tqdm(self.val_loader, desc='Validation'):
                 try:
                     images = batch['images'].to(self.device, dtype=torch.float32, non_blocking=True)
                     targets = {
@@ -268,7 +406,6 @@ class Trainer:
                         'images': images
                     }
                     
-                    # fwd
                     predictions = self.model(images)
                     loss, loss_components = self.criterion(predictions, targets)
                     
@@ -276,32 +413,9 @@ class Trainer:
                     total_components['box_loss'] += loss_components[0].item()
                     total_components['obj_loss'] += loss_components[1].item()
                     total_components['cls_loss'] += loss_components[2].item()
-                    
-                    # 🎨 VALIDATION VISUALIZATION: Save occasional validation visualizations
-                    if batch_idx == 0 and self.current_epoch % 5 == 0:  # First validation batch every 5 epochs
-                        slice_ids = batch.get('slice_ids', [f'val_batch_{batch_idx}_sample_{i}' for i in range(len(images))])
-                        
-                        logger.info(f"📸 Creating validation visualization for epoch {self.current_epoch}")
-                        # Save to a different directory for validation
-                        val_vis_dir = self.output_dir / 'validation_visualizations'
-                        val_vis_dir.mkdir(exist_ok=True)
-                        
-                        # Create temporary visualizer for validation
-                        val_visualizer = TrainingVisualizer(str(self.output_dir), save_interval=1)
-                        val_visualizer.vis_dir = val_vis_dir
-                        
-                        val_visualizer.save_training_visualization(
-                            batch_idx=batch_idx,
-                            epoch=self.current_epoch,
-                            images=images,
-                            targets=targets,
-                            predictions=predictions,
-                            slice_ids=slice_ids
-                        )
                 
                 except RuntimeError as e:
                     if "out of memory" in str(e):
-                        logger.warning("CUDA OOM during validation. Clearing cache and continuing.")
                         torch.cuda.empty_cache()
                         continue
                     else:
@@ -313,7 +427,6 @@ class Trainer:
         return avg_loss, avg_components
     
     def save_checkpoint(self, filename='checkpoint.pth', is_best=False):
-        """Save model checkpoint"""
         checkpoint = {
             'epoch': self.current_epoch,
             'model_state_dict': self.model.state_dict(),
@@ -321,11 +434,9 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
             'best_loss': self.best_loss,
-            'best_map': self.best_map,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'learning_rates': self.learning_rates,
-            'config': self.config.config if hasattr(self.config, 'config') else self.config
         }
         
         checkpoint_path = self.output_dir / 'checkpoints' / filename
@@ -340,7 +451,6 @@ class Trainer:
         logger.info("Starting training...")
         logger.info(f"Device: {self.device}")
         logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        logger.info(f"🎨 Visualizations will be saved to: {self.output_dir / 'training_visualizations'}")
         
         num_epochs = self.config.get('training.num_epochs', 100)
         save_interval = self.config.get('logging.save_interval', 25)
@@ -350,15 +460,15 @@ class Trainer:
                 self.current_epoch = epoch
                 epoch_start_time = time.time()
                 
-                # training 
+                # Training
                 train_loss, train_components = self.train_epoch()
                 self.train_losses.append(train_loss)
                 
-                # validation 
+                # Validation
                 val_loss, val_components = self.validate_epoch()
                 self.val_losses.append(val_loss)
                 
-                # update learning rate
+                # Update learning rate
                 current_lr = self.optimizer.param_groups[0]['lr']
                 self.learning_rates.append(current_lr)
                 
@@ -378,18 +488,6 @@ class Trainer:
                     f"Time: {epoch_time:.1f}s"
                 )
                 
-                if epoch % 10 == 0:
-                    logger.info(
-                        f"  Train Components - Box: {train_components['box_loss']:.4f}, "
-                        f"Obj: {train_components['obj_loss']:.4f}, "
-                        f"Cls: {train_components['cls_loss']:.4f}"
-                    )
-                    logger.info(
-                        f"  Val Components - Box: {val_components['box_loss']:.4f}, "
-                        f"Obj: {val_components['obj_loss']:.4f}, "
-                        f"Cls: {val_components['cls_loss']:.4f}"
-                    )
-                
                 if val_loss < self.best_loss:
                     self.best_loss = val_loss
                     self.save_checkpoint('best_model.pth', is_best=True)
@@ -402,110 +500,82 @@ class Trainer:
                 
                 if epoch % save_interval == 0 and epoch > 0:
                     self.save_checkpoint(f'checkpoint_epoch_{epoch}.pth')
-                    logger.info(f"Saved checkpoint at epoch {epoch}")
                 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         
         except KeyboardInterrupt:
-            logger.info("Training interrupted by user")
+            logger.info("Training interrupted")
         except Exception as e:
-            logger.error(f"Training failed with error: {e}")
+            logger.error(f"Training failed: {e}")
             raise
         finally:
             self.save_checkpoint('final_model.pth')
-            logger.info("Final model saved")
-            
-            # Log visualization summary
-            total_visualizations = self.visualizer.batch_count // self.visualizer.save_interval
-            logger.info(f"🎨 Training completed! Created {total_visualizations} training visualizations")
-            logger.info(f"📁 Visualizations saved in: {self.output_dir / 'training_visualizations'}")
-            
-            logger.info("Training completed successfully!")
+            logger.info(f"Training completed! Saved {self.visualizer.batch_count} visualizations")
 
 def create_default_config(args=None):
-   """Create default configuration dictionary with optional args override"""
-   config = {
-       'model': {
-           'num_classes': 1,
-           'input_channels': 4,
-           'img_size': 640,
-           'confidence_threshold': 0.25,
-           'nms_threshold': 0.45
-       },
-       'training': {
-           'batch_size': 4,  # Reduced for 4-channel input
-           'num_epochs': 100,
-           'learning_rate': 0.001,
-           'weight_decay': 0.0001,
-           'mixed_precision': True,
-           'early_stopping': True,
-           'patience': 20,
-           'min_delta': 0.001
-       },
-       'data': {
-           'data_dir': './data',
-           'num_workers': 4,
-           'pin_memory': True
-       },
-       'augmentation': {
-           'enabled': True,
-           'horizontal_flip': 0.5,
-           'brightness_contrast': 0.3,
-           'gamma': 0.3,
-           'noise': 0.3,
-           'random_crop_scale': [0.8, 1.0]
-       },
-       'loss': {
-           'ignore_threshold': 0.5,
-           'focal_alpha': 0.25,
-           'focal_gamma': 2.0
-       },
-       'optimizer': {
-           'type': 'AdamW',
-           'lr_scheduler': 'CosineAnnealingLR'
-       },
-       'logging': {
-           'output_dir': 'outputs',
-           'save_interval': 25
-       },
-       'visualization': {
-           'save_interval': 100,          # Save visualization every 100 batches
-           'modality_for_display': 1,     # 0=T1, 1=T1ce, 2=T2, 3=FLAIR
-           'confidence_threshold': 0.1,   # Lower threshold to see more predictions
-           'max_predictions_display': 10, # Maximum predictions to show
-           'save_validation_vis': True    # Save validation visualizations too
-       }
-   }
-   
-   # Override with command line arguments if provided
-   if args:
-       if args.data_dir:
-           config['data']['data_dir'] = args.data_dir
-       if args.output_dir:
-           config['logging']['output_dir'] = args.output_dir
-       if args.batch_size:
-           config['training']['batch_size'] = args.batch_size
-       if args.epochs:
-           config['training']['num_epochs'] = args.epochs
-       if args.lr:
-           config['training']['learning_rate'] = args.lr
-       if args.img_size:
-           config['model']['img_size'] = args.img_size
-       if args.workers:
-           config['data']['num_workers'] = args.workers
-       if args.mixed_precision:
-           config['training']['mixed_precision'] = True
-   
-   return config
+    config = {
+        'model': {
+            'num_classes': 1,
+            'input_channels': 4,
+            'img_size': 640,
+        },
+        'training': {
+            'batch_size': 4,
+            'num_epochs': 100,
+            'learning_rate': 0.001,
+            'weight_decay': 0.0001,
+            'mixed_precision': True,
+            'early_stopping': True,
+            'patience': 20,
+            'min_delta': 0.001
+        },
+        'data': {
+            'data_dir': './data',
+            'num_workers': 4,
+            'pin_memory': True
+        },
+        'augmentation': {
+            'enabled': True,
+        },
+        'optimizer': {
+            'type': 'AdamW',
+            'lr_scheduler': 'CosineAnnealingLR'
+        },
+        'logging': {
+            'output_dir': 'outputs',
+            'save_interval': 25
+        },
+        'visualization': {
+            'save_interval': 100,
+        }
+    }
+    
+    if args:
+        if args.data_dir:
+            config['data']['data_dir'] = args.data_dir
+        if args.output_dir:
+            config['logging']['output_dir'] = args.output_dir
+        if args.batch_size:
+            config['training']['batch_size'] = args.batch_size
+        if args.epochs:
+            config['training']['num_epochs'] = args.epochs
+        if args.lr:
+            config['training']['learning_rate'] = args.lr
+        if args.img_size:
+            config['model']['img_size'] = args.img_size
+        if args.workers:
+            config['data']['num_workers'] = args.workers
+        if args.mixed_precision:
+            config['training']['mixed_precision'] = True
+    
+    return config
 
 class SimpleConfig:
-    """Simple configuration class"""
     def __init__(self, config_dict=None):
         self.config = config_dict or create_default_config()
     
     def get(self, key, default=None):
-        """Get nested configuration value"""
         keys = key.split('.')
         value = self.config
         for k in keys:
@@ -516,82 +586,28 @@ class SimpleConfig:
         return value
 
 def main():
-    """Main function with argument parsing"""
     parser = get_train_arg_parser()
-    
-    # Add visualization-specific arguments
-    parser.add_argument('--vis_interval', type=int, default=20, help='Save visualization every N batches')
-    parser.add_argument('--vis_modality', type=int, default=1, choices=[0,1,2,3],
-                       help='Modality to use for visualization (0=T1, 1=T1ce, 2=T2, 3=FLAIR)')
-    
     args = parser.parse_args()
     
-    # config file + override with args input
     config_dict = create_default_config(args)
-    
-    # Override visualization settings from args
-    if args.vis_interval:
-        config_dict['visualization']['save_interval'] = args.vis_interval
-    if args.vis_modality is not None:
-        config_dict['visualization']['modality_for_display'] = args.vis_modality
-    
     config = SimpleConfig(config_dict)
     
-    logger.info("=" * 70)
-    logger.info("🧠 MULTIMODAL PK-YOLO TRAINING WITH VISUALIZATION 🎨")
-    logger.info("=" * 70)
-    logger.info(f"  Data directory: {config.get('data.data_dir')}")
-    logger.info(f"  Output directory: {config.get('logging.output_dir')}")
-    logger.info(f"  Batch size: {config.get('training.batch_size')}")
-    logger.info(f"  Epochs: {config.get('training.num_epochs')}")
-    logger.info(f"  Learning rate: {config.get('training.learning_rate')}")
-    logger.info(f"  Image size: {config.get('model.img_size')}")
-    logger.info(f"  Mixed precision: {config.get('training.mixed_precision')}")
-    logger.info(f"  Early stopping: {config.get('training.early_stopping')}")
-    logger.info("  " + "-" * 66)
-    logger.info(f"🎨 Visualization interval: every {config.get('visualization.save_interval')} batches")
-    logger.info(f"🧠 Display modality: {['T1', 'T1ce', 'T2', 'FLAIR'][config.get('visualization.modality_for_display')]}")
-    logger.info(f"🎯 Confidence threshold: {config.get('visualization.confidence_threshold')}")
-    logger.info("=" * 70)
+    logger.info("🧠 MULTIMODAL PK-YOLO TRAINING 🎨")
+    logger.info(f"Data directory: {config.get('data.data_dir')}")
+    logger.info(f"Output directory: {config.get('logging.output_dir')}")
+    logger.info(f"Batch size: {config.get('training.batch_size')}")
+    logger.info(f"Epochs: {config.get('training.num_epochs')}")
+    logger.info(f"Visualization: every {config.get('visualization.save_interval')} batches")
     
     try:
         trainer = Trainer(config)
         trainer.load_datasets()
-    except Exception as e:
-        logger.error(f"Failed to initialize trainer: {e}")
-        return
-    
-    # Resume from checkpoint if specified
-    if args.resume:
-        if Path(args.resume).exists():
-            # Note: load_checkpoint method would need to be implemented
-            logger.info(f"Resume functionality not implemented yet: {args.resume}")
-        else:
-            logger.error(f"Checkpoint file not found: {args.resume}")
-            return
-    
-    try:
-        logger.info("🚀 Starting training process...")
         trainer.train()
-        logger.info("✅ [SUCCESS] Training completed successfully!")
-        logger.info(f"📊 [RESULTS] Best validation loss: {trainer.best_loss:.4f}")
-        logger.info(f"💾 [OUTPUT] Models saved in: {trainer.output_dir / 'checkpoints'}")
-        logger.info(f"🎨 [VISUALS] Training visualizations: {trainer.output_dir / 'training_visualizations'}")
-        logger.info(f"🔍 [VALIDATION] Validation visualizations: {trainer.output_dir / 'validation_visualizations'}")
+        logger.info("✅ Training completed successfully!")
         
-    except KeyboardInterrupt:
-        logger.info("Training interrupted by user")
     except Exception as e:
         logger.error(f"Training failed: {e}")
-        import traceback
-        traceback.print_exc()
         raise
 
 if __name__ == "__main__":
-    try:
-        import multiprocessing
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-    
     main()
