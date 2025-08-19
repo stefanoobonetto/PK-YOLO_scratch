@@ -15,29 +15,25 @@ class YOLOLoss(nn.Module):
         self.device = device
         self.num_classes = num_classes
         
-        # conservative hyps
         self.hyp = {
-            'box': 0.05,                # Box loss weight
-            'cls': 0.3,                 # Class loss weight  
-            'obj': 1.0,                 # Object loss weight
-            'anchor_t': 4.0,            # Anchor matching threshold
-            'fl_gamma': 0.0,            # Focal loss gamma (disabled to prevent NaN)
-            'cls_pw': 1.0,              # Class positive weight
-            'obj_pw': 1.0,              # Object positive weight
-            'label_smoothing': 0.0,     # No label smoothing to start
+            'box': 0.05,
+            'cls': 0.3,
+            'obj': 1.0,
+            'anchor_t': 4.0,
+            'fl_gamma': 0.0,
+            'cls_pw': 1.0,
+            'obj_pw': 1.0,
+            'label_smoothing': 0.0,
         }
         
-        # https://docs.pytorch.org/docs/stable/generated/torch.nn.BCEWithLogitsLoss.html
         self.BCEcls = nn.BCEWithLogitsLoss(reduction='none')
         self.BCEobj = nn.BCEWithLogitsLoss(reduction='none')
         
-        # Anchors COCO 
-        # TODO --> maybe use KMeans for custom anchors
         if anchors is None:
             self.anchors = torch.tensor([
-                [[10, 13], [16, 30], [33, 23]],      # P3/8
-                [[30, 61], [62, 45], [59, 119]],     # P4/16  
-                [[116, 90], [156, 198], [373, 326]]  # P5/32
+                [[10, 13], [16, 30], [33, 23]],
+                [[30, 61], [62, 45], [59, 119]],
+                [[116, 90], [156, 198], [373, 326]]
             ], dtype=torch.float32, device=device)
         else:
             self.anchors = anchors.to(device)
@@ -51,135 +47,102 @@ class YOLOLoss(nn.Module):
             
     def forward(self, predictions, targets):        
         targets_tensor = self._prepare_targets(targets)
-        
         p = self._prepare_predictions(predictions)
         
-        # Adjust for model architecture
         if len(p) != self.nl:
             self._adjust_to_predictions(len(p))
         
         bs = p[0].shape[0]
-        loss = torch.zeros(3, device=self.device)  # [box, obj, cls] losses
+        loss = torch.zeros(3, device=self.device)
         
-        # Check if we have any positive samples
         has_positive_samples = targets_tensor.shape[0] > 0
         
         if has_positive_samples:
-            # Build targets for positive samples
             tcls, tbox, indices, anchors = self.build_targets(p, targets_tensor)
         else:
-            # No positive samples - create empty targets
             tcls = [torch.zeros(0, dtype=torch.long, device=self.device) for _ in range(len(p))]
             tbox = [torch.zeros(0, 4, device=self.device) for _ in range(len(p))]
             indices = [(torch.zeros(0, dtype=torch.long, device=self.device),) * 4 for _ in range(len(p))]
             anchors = [torch.zeros(0, 2, device=self.device) for _ in range(len(p))]
         
-        # Calculate losses for each detection layer
         for i, pi in enumerate(p):
             if i >= len(indices):
                 continue
                 
-            # Get prediction shape
             b_size, n_anchors, h, w, n_outputs = pi.shape
-            
-            # Target objectness - all zeros initially (no objects)
             tobj = torch.zeros((b_size, n_anchors, h, w), dtype=pi.dtype, device=self.device)
             
-            # Handle positive samples if they exist
             if has_positive_samples and len(indices[i]) == 4:
                 b, a, gj, gi = indices[i]
                 n = b.shape[0]
                 
                 if n > 0:
-                    # Get predictions for matched targets
-                    ps = pi[b, a, gj, gi]  # prediction subset
+                    ps = pi[b, a, gj, gi]
                     
-                    # Split predictions
                     pxy = ps[:, 0:2]
                     pwh = ps[:, 2:4]
                     pobj = ps[:, 4:5]
                     pcls = ps[:, 5:] if self.num_classes > 0 else torch.zeros_like(pobj)
                     
-                    # Apply activations with clamping to prevent NaN
                     pxy = torch.sigmoid(pxy) * 2.0 - 0.5
                     pwh = torch.clamp((torch.sigmoid(pwh) * 2) ** 2, min=1e-6, max=1e6) * anchors[i]
                     pbox = torch.cat((pxy, pwh), 1)
                     
-                    # IoU calculation with NaN protection
                     iou = self.bbox_iou(pbox, tbox[i], CIoU=True).squeeze(-1)
-                    iou = torch.clamp(iou, min=0.0, max=1.0)  # Clamp to valid range
+                    iou = torch.clamp(iou, min=0.0, max=1.0)
                     
                     if iou.numel() > 0 and not torch.isnan(iou).any():
                         box_loss = (1.0 - iou).mean()
                         
-                        # Check for NaN
                         if not torch.isnan(box_loss):
                             loss[0] += box_loss
-                        else:
-                            logger.warning("NaN detected in box loss, skipping")
                         
-                        # Set positive objectness targets
                         iou_detached = iou.detach().clamp(0, 1).type(tobj.dtype)
                         if self.gr < 1:
                             iou_detached = (1.0 - self.gr) + self.gr * iou_detached
                         tobj[b, a, gj, gi] = iou_detached
                     
-                    # Classification loss with NaN protection
                     if self.num_classes > 0 and pcls.numel() > 0:
                         t = torch.zeros_like(pcls, device=self.device)
                         if len(tcls[i]) > 0:
                             t[range(n), tcls[i]] = 1.0
                         
                         cls_loss = self.BCEcls(pcls, t)
-                        cls_loss = torch.clamp(cls_loss, min=0.0, max=100.0)  # Clamp extreme values
+                        cls_loss = torch.clamp(cls_loss, min=0.0, max=100.0)
                         cls_loss_mean = cls_loss.mean()
                         
                         if not torch.isnan(cls_loss_mean):
                             loss[2] += cls_loss_mean
-                        else:
-                            logger.warning("NaN detected in cls loss, skipping")
             
-            # Objectness loss with NaN protection (CRITICAL for all samples)
-            pi_obj = pi[..., 4]  # Extract objectness predictions
-            
-            # Apply BCE loss
+            pi_obj = pi[..., 4]
             obj_loss = self.BCEobj(pi_obj, tobj)
-            obj_loss = torch.clamp(obj_loss, min=0.0, max=100.0)  # Clamp extreme values
+            obj_loss = torch.clamp(obj_loss, min=0.0, max=100.0)
             
-            # Weight by spatial importance and check for NaN
             if not torch.isnan(obj_loss).any():
                 obj_loss_weighted = obj_loss.mean() * (self.balance[i] if i < len(self.balance) else 1.0)
                 loss[1] += obj_loss_weighted
             else:
-                logger.warning(f"NaN detected in obj loss layer {i}, using fallback")
-                # Fallback: use a small positive loss to maintain training
                 loss[1] += torch.tensor(0.1, device=self.device)
         
-        # Apply loss weights
         loss[0] *= self.hyp['box']
         loss[1] *= self.hyp['obj']
         loss[2] *= self.hyp['cls']
         
-        # Final NaN check and correction
         for i in range(3):
             if torch.isnan(loss[i]):
-                logger.warning(f"NaN in loss component {i}, setting to 0.1")
                 loss[i] = torch.tensor(0.1, device=self.device)
         
         total_loss = loss.sum() * bs
         
-        # Final total loss NaN check
         if torch.isnan(total_loss):
-            logger.error("NaN in total loss! Using fallback loss.")
             total_loss = torch.tensor(1.0, device=self.device)
             loss = torch.tensor([0.1, 0.8, 0.1], device=self.device)
         
         return total_loss, loss.detach()
     
     def bbox_iou(self, box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
-        """IoU calculation with NaN protection"""
+        """IoU calculation with numerical stability"""
         
-        # Get coordinates
         if xywh:
             (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
             w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
@@ -191,16 +154,14 @@ class YOLOLoss(nn.Module):
             w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
             w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
 
-        # Intersection
         inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
                 (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
 
-        # Union with NaN protection
         union = w1 * h1 + w2 * h2 - inter + eps
-        union = torch.clamp(union, min=eps)  # Prevent division by zero
+        union = torch.clamp(union, min=eps)
         
         iou = inter / union
-        iou = torch.clamp(iou, min=0.0, max=1.0)  # Ensure valid IoU range
+        iou = torch.clamp(iou, min=0.0, max=1.0)
         
         if CIoU or DIoU or GIoU:
             cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
@@ -208,18 +169,17 @@ class YOLOLoss(nn.Module):
             
             if CIoU or DIoU:
                 c2 = cw ** 2 + ch ** 2 + eps
-                c2 = torch.clamp(c2, min=eps)  # Prevent division by zero
+                c2 = torch.clamp(c2, min=eps)
                 rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 + (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4
                 
                 if CIoU:
-                    # Prevent NaN in atan calculation
                     w2_safe = torch.clamp(w2, min=eps)
                     h2_safe = torch.clamp(h2, min=eps)
                     w1_safe = torch.clamp(w1, min=eps)
                     h1_safe = torch.clamp(h1, min=eps)
                     
                     v = (4 / math.pi ** 2) * torch.pow(torch.atan(w2_safe / h2_safe) - torch.atan(w1_safe / h1_safe), 2)
-                    v = torch.clamp(v, min=0.0, max=4.0)  # Reasonable bounds
+                    v = torch.clamp(v, min=0.0, max=4.0)
                     
                     with torch.no_grad():
                         alpha = v / (v - iou + (1 + eps))
@@ -238,13 +198,6 @@ class YOLOLoss(nn.Module):
         return iou
     
     def _prepare_targets(self, targets):
-        # batch in train_loader
-        # targets = {
-        #     'bboxes': batch['bboxes'],
-        #     'labels': batch['labels'],
-        #     'images': images
-        # }
-        
         if isinstance(targets, dict):
             batch_size = targets['images'].shape[0]
             target_list = []
@@ -254,7 +207,6 @@ class YOLOLoss(nn.Module):
                 labels = targets['labels'][i]
                 
                 if torch.isnan(bboxes).any() or torch.isinf(bboxes).any():
-                    logger.warning(f"Invalid bboxes detected in batch {i}, skipping")
                     continue
                 
                 valid_mask = (bboxes.sum(dim=1) > 0) & (labels >= 0)
@@ -283,17 +235,13 @@ class YOLOLoss(nn.Module):
         """Convert predictions with validation"""
         p = []
         for i, (cls_score, bbox_pred, objectness) in enumerate(predictions):
-            # Check for NaN in predictions
             if torch.isnan(cls_score).any() or torch.isnan(bbox_pred).any() or torch.isnan(objectness).any():
-                logger.warning(f"NaN detected in predictions at scale {i}")
-                # Replace NaN with small values
                 cls_score = torch.nan_to_num(cls_score, nan=0.0, posinf=1.0, neginf=-1.0)
                 bbox_pred = torch.nan_to_num(bbox_pred, nan=0.0, posinf=10.0, neginf=-10.0)
                 objectness = torch.nan_to_num(objectness, nan=0.0, posinf=1.0, neginf=-1.0)
             
             B, _, H, W = cls_score.shape
             
-            # Reshape predictions
             cls_score = cls_score.view(B, self.na, self.num_classes, H, W).permute(0, 1, 3, 4, 2).contiguous()
             bbox_pred = bbox_pred.view(B, self.na, 4, H, W).permute(0, 1, 3, 4, 2).contiguous()
             objectness = objectness.view(B, self.na, 1, H, W).permute(0, 1, 3, 4, 2).contiguous()
@@ -306,7 +254,6 @@ class YOLOLoss(nn.Module):
     def _adjust_to_predictions(self, num_predictions):
         """Adjust loss parameters"""
         if num_predictions != self.nl:
-            logger.warning(f"Adjusting nl from {self.nl} to {num_predictions}")
             self.nl = num_predictions
             self.balance = [1.0] * num_predictions
     
@@ -331,14 +278,13 @@ class YOLOLoss(nn.Module):
             
             t = targets * gain
             if nt:
-                # Clamp targets to prevent extreme values
                 t[:, :, 2:6] = torch.clamp(t[:, :, 2:6], min=0.0, max=float(max(shape[2:4])))
                 
                 r = t[..., 4:6] / anchors[:, None]
                 j = torch.max(r, 1 / (r + 1e-16)).max(2)[0] < self.hyp['anchor_t']
                 t = t[j]
                 
-                if t.shape[0] > 0:  # Check if we have any targets left
+                if t.shape[0] > 0:
                     gxy = t[:, 2:4]
                     gxi = gain[[2, 3]] - gxy
                     j, k = ((gxy % 1 < g) & (gxy > 1)).T
@@ -359,7 +305,6 @@ class YOLOLoss(nn.Module):
                 gij = (gxy - offsets).long()
                 gi, gj = gij.T
                 
-                # Bounds checking
                 gi = gi.clamp_(0, shape[3] - 1)
                 gj = gj.clamp_(0, shape[2] - 1)
                 
@@ -368,7 +313,6 @@ class YOLOLoss(nn.Module):
                 anch.append(anchors[a])
                 tcls.append(c)
             else:
-                # Empty targets for this layer
                 indices.append((torch.zeros(0, dtype=torch.long, device=self.device),) * 4)
                 tbox.append(torch.zeros(0, 4, device=self.device))
                 anch.append(torch.zeros(0, 2, device=self.device))
