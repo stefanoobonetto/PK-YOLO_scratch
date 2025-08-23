@@ -33,7 +33,7 @@ class Visualizer:
     def should_save(self, batch_idx: int) -> bool:
         return batch_idx % self.save_interval == 0
     
-    def decode_predictions(self, predictions, img_size=640, conf_thresh=0.1):
+    def decode_predictions(self, predictions, img_size=640, conf_thresh=0.5): 
         """Decode YOLO predictions to bounding boxes"""
         detections = []
         
@@ -69,7 +69,7 @@ class Visualizer:
                             cls_conf = cls_prob[0, a, i, j, 0].item()
                             total_conf = obj_conf * cls_conf
                             
-                            if total_conf > conf_thresh:
+                            if total_conf > (conf_thresh + 0.2):  
                                 bbox = bbox_pred[0, a, i, j]
                                 
                                 xy = torch.sigmoid(bbox[0:2]) * 2.0 - 0.5
@@ -80,13 +80,53 @@ class Visualizer:
                                 width = wh[0] / img_size
                                 height = wh[1] / img_size
                                 
-                                detections.append({
-                                    'bbox': [x_center.item(), y_center.item(), width.item(), height.item()],
-                                    'confidence': total_conf
-                                })
+                                if 0.02 < width < 0.8 and 0.02 < height < 0.8:
+                                    detections.append({
+                                        'bbox': [x_center.item(), y_center.item(), width.item(), height.item()],
+                                        'confidence': total_conf
+                                    })
         
+        detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)[:5]  # Max 5 pred
+
         return detections
-    
+
+    # Fix aggiuntivo per il caricamento delle immagini nel dataset
+    def load_multimodal_image(self, slice_id):
+        """Load all 4 modalities with better error handling"""
+        modalities = ['t1', 't1ce', 't2', 'flair']
+        images = []
+        
+        for modality in modalities:
+            possible_paths = [
+                self.image_dir / f"{slice_id}_{modality}.png",
+                self.image_dir / f"{slice_id}_{modality}.PNG",
+            ]
+            
+            img = None
+            for img_path in possible_paths:
+                if img_path.exists():
+                    img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+                    if img is not None and img.size > 0:  # Verifica che l'immagine sia valida
+                        break
+                    else:
+                        img = None
+            
+            if img is None:
+                logger.warning(f"Missing or corrupted {modality} for {slice_id}")
+                img = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+            else:
+                # Verifica che l'immagine non sia corrotta
+                if img.std() < 1.0:  # Immagine troppo uniforme (possibile corruzione)
+                    logger.warning(f"Potentially corrupted {modality} for {slice_id} (low std: {img.std()})")
+                
+                if img.shape[:2] != (self.img_size, self.img_size):
+                    img = cv2.resize(img, (self.img_size, self.img_size))
+            
+            images.append(img)
+        
+        multimodal_img = np.stack(images, axis=-1)
+        return multimodal_img
+
     def save_visualization(self, batch_idx: int, epoch: int, images: torch.Tensor, targets: dict, predictions, slice_ids: list):
         """Save visualization with GT and predictions"""
         try:
@@ -507,7 +547,7 @@ def create_default_config(args=None):
             'save_interval': 25
         },
         'visualization': {
-            'save_interval': 100,
+            'save_interval': 500,
         }
     }
     
