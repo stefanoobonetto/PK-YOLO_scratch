@@ -50,15 +50,10 @@ class BrainTumorDetector:
     
     def preprocess_multimodal_image(self, image_paths: Dict[str, str], img_size: int = 640) -> torch.Tensor:
         """
-        Preprocess multimodal MRI images
-        
-        Args:
-            image_paths: Dict with keys ['t1', 't1ce', 't2', 'flair'] and paths as values
-            img_size: Target image size
+        Preprocess multimodal MRI images (T1, T1ce, T2, FLAIR) con normalizzazione allineata al training.
         """
         modalities = ['t1', 't1ce', 't2', 'flair']
         images = []
-        
         for modality in modalities:
             if modality in image_paths and Path(image_paths[modality]).exists():
                 img = cv2.imread(image_paths[modality], cv2.IMREAD_GRAYSCALE)
@@ -66,17 +61,22 @@ class BrainTumorDetector:
             else:
                 logger.warning(f"Missing {modality} image, using zeros")
                 img = np.zeros((img_size, img_size), dtype=np.uint8)
-            
-            # Normalize
+
             img = img.astype(np.float32) / 255.0
             images.append(img)
-        
-        # Stack to create 4-channel image and add batch dimension
-        multimodal_img = np.stack(images, axis=0)  # (4, H, W)
-        tensor = torch.from_numpy(multimodal_img).unsqueeze(0).to(self.device)  # (1, 4, H, W)
-        
+
+        # (4, H, W)
+        multimodal_img = np.stack(images, axis=0).astype(np.float32)
+
+        MEAN = np.array([0.485, 0.456, 0.406, 0.485], dtype=np.float32)
+        STD  = np.array([0.229, 0.224, 0.225, 0.229], dtype=np.float32)
+        multimodal_img = (multimodal_img - MEAN[:, None, None]) / STD[:, None, None]
+
+        # (1, 4, H, W)
+        tensor = torch.from_numpy(multimodal_img).unsqueeze(0).to(self.device)
         return tensor
-    
+
+
     def post_process_predictions(self, predictions: List) -> List[Dict]:
         """
         Post-process model predictions to extract bounding boxes
@@ -103,15 +103,14 @@ class BrainTumorDetector:
                 
             batch_size, _, h, w = cls_score.shape
             stride = strides[scale_idx]
-            scale_anchors = torch.tensor(anchors[scale_idx], device=cls_score.device)
-            
-            # Reshape predictions
+            # anchor -> grid units (anc_px / stride)
+            scale_anchors = torch.tensor(anchors[scale_idx], device=cls_score.device, dtype=torch.float32) / float(stride)
+
             num_anchors = 3
             cls_score = cls_score.view(batch_size, num_anchors, 1, h, w).permute(0, 1, 3, 4, 2).contiguous()
             bbox_pred = bbox_pred.view(batch_size, num_anchors, 4, h, w).permute(0, 1, 3, 4, 2).contiguous()
             objectness = objectness.view(batch_size, num_anchors, h, w)
             
-            # Apply sigmoid to get probabilities
             cls_prob = torch.sigmoid(cls_score)
             obj_prob = torch.sigmoid(objectness)
             
@@ -134,13 +133,13 @@ class BrainTumorDetector:
                                     # Apply sigmoid and scale
                                     xy = torch.sigmoid(bbox[0:2]) * 2.0 - 0.5
                                     wh = (torch.sigmoid(bbox[2:4]) * 2) ** 2 * scale_anchors[a]
-                                    
+
                                     # Convert to image coordinates
                                     x_center = (xy[0] + j) * stride / 640
                                     y_center = (xy[1] + i) * stride / 640
-                                    width = wh[0] / 640
-                                    height = wh[1] / 640
-                                    
+                                    width  = (wh[0] * stride) / 640.0
+                                    height = (wh[1] * stride) / 640.0
+
                                     detections.append({
                                         'bbox': [x_center.item(), y_center.item(), width.item(), height.item()],
                                         'confidence': total_conf,

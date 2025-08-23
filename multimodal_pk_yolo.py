@@ -280,13 +280,14 @@ class MultimodalPKYOLO(nn.Module):
     def forward(self, x):
         features = self.backbone(x)
         fpn_features = self.neck(features)
-        
+        fpn_features = fpn_features[-3:]  # <-- tieni solo P3,P4,P5
+
         predictions = []
         for feat in fpn_features:
             cls_score, bbox_pred, objectness = self.head(feat)
             predictions.append((cls_score, bbox_pred, objectness))
-        
         return predictions
+
 
 def get_model_info(model):
     """Get model information"""

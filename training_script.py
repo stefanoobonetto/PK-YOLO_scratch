@@ -33,7 +33,7 @@ class Visualizer:
     def should_save(self, batch_idx: int) -> bool:
         return batch_idx % self.save_interval == 0
     
-    def decode_predictions(self, predictions, img_size=640, conf_thresh=0.5): 
+    def decode_predictions(self, predictions, img_size=640, conf_thresh=0.05): 
         """Decode YOLO predictions to bounding boxes"""
         detections = []
         
@@ -50,8 +50,9 @@ class Visualizer:
                 
             batch_size, _, h, w = cls_score.shape
             stride = strides[scale_idx]
-            scale_anchors = torch.tensor(anchors[scale_idx], device=cls_score.device)
-            
+            # anchor -> grid units
+            scale_anchors = torch.tensor(anchors[scale_idx], device=cls_score.device, dtype=torch.float32) / float(stride)
+
             num_anchors = 3
             cls_score = cls_score.view(batch_size, num_anchors, 1, h, w).permute(0, 1, 3, 4, 2)
             bbox_pred = bbox_pred.view(batch_size, num_anchors, 4, h, w).permute(0, 1, 3, 4, 2)
@@ -65,26 +66,25 @@ class Visualizer:
                     for j in range(w):
                         obj_conf = obj_prob[0, a, i, j].item()
                         
-                        if obj_conf > conf_thresh:
-                            cls_conf = cls_prob[0, a, i, j, 0].item()
-                            total_conf = obj_conf * cls_conf
+                        cls_conf = cls_prob[0, a, i, j, 0].item()
+                        total_conf = obj_conf * cls_conf
                             
-                            if total_conf > (conf_thresh + 0.2):  
-                                bbox = bbox_pred[0, a, i, j]
-                                
-                                xy = torch.sigmoid(bbox[0:2]) * 2.0 - 0.5
-                                wh = (torch.sigmoid(bbox[2:4]) * 2) ** 2 * scale_anchors[a]
-                                
-                                x_center = (xy[0] + j) * stride / img_size
-                                y_center = (xy[1] + i) * stride / img_size
-                                width = wh[0] / img_size
-                                height = wh[1] / img_size
-                                
-                                if 0.02 < width < 0.8 and 0.02 < height < 0.8:
-                                    detections.append({
-                                        'bbox': [x_center.item(), y_center.item(), width.item(), height.item()],
-                                        'confidence': total_conf
-                                    })
+                        if total_conf > conf_thresh:  
+                            bbox = bbox_pred[0, a, i, j]
+                            
+                            xy = torch.sigmoid(bbox[0:2]) * 2.0 - 0.5
+                            wh = (torch.sigmoid(bbox[2:4]) * 2) ** 2 * scale_anchors[a]
+
+                            x_center = (xy[0] + j) * stride / img_size
+                            y_center = (xy[1] + i) * stride / img_size
+                            width  = (wh[0] * stride) / float(img_size)
+                            height = (wh[1] * stride) / float(img_size)
+                            
+                            if 0.02 < width < 0.8 and 0.02 < height < 0.8:
+                                detections.append({
+                                    'bbox': [x_center.item(), y_center.item(), width.item(), height.item()],
+                                    'confidence': total_conf
+                                })
         
         detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)[:5]  # Max 5 pred
 

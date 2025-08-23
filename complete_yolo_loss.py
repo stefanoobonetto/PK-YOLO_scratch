@@ -8,13 +8,14 @@ logger = logging.getLogger(__name__)
 
 class YOLOLoss(nn.Module):
     
-    def __init__(self, model, num_classes=1, anchors=None, autobalance=False):
+    def __init__(self, model, num_classes=1, anchors=None, autobalance=False, img_size=640):
         super().__init__()
         
         device = next(model.parameters()).device
         self.device = device
         self.num_classes = num_classes
-        
+        self.img_size = img_size
+
         self.hyp = {
             'box': 0.05,
             'cls': 0.3,
@@ -48,7 +49,16 @@ class YOLOLoss(nn.Module):
     def forward(self, predictions, targets):        
         targets_tensor = self._prepare_targets(targets)
         p = self._prepare_predictions(predictions)
-        
+
+        # p[i].shape = (B, na, H, W, n_outputs)
+        grid_hw = [pi.shape[2:4] for pi in p]            # [(H,W), ...]
+        img_size = 640.0
+        strides = [img_size / float(w) for (_, w) in grid_hw]
+        scaled_anchors = [
+            self.anchors[i].to(self.device) / float(strides[i])
+            for i in range(min(self.nl, len(p)))
+        ]
+
         if len(p) != self.nl:
             self._adjust_to_predictions(len(p))
         
@@ -58,12 +68,15 @@ class YOLOLoss(nn.Module):
         has_positive_samples = targets_tensor.shape[0] > 0
         
         if has_positive_samples:
-            tcls, tbox, indices, anchors = self.build_targets(p, targets_tensor)
+            tcls, tbox, indices, anch = self.build_targets(p, targets_tensor, scaled_anchors)
+            npos = sum(len(idx[0]) for idx in indices)
+            if npos == 0:
+                logger.warning("YOLOLoss: 0 positive matches this batch")
         else:
             tcls = [torch.zeros(0, dtype=torch.long, device=self.device) for _ in range(len(p))]
             tbox = [torch.zeros(0, 4, device=self.device) for _ in range(len(p))]
             indices = [(torch.zeros(0, dtype=torch.long, device=self.device),) * 4 for _ in range(len(p))]
-            anchors = [torch.zeros(0, 2, device=self.device) for _ in range(len(p))]
+            anch = [torch.zeros(0, 2, device=self.device) for _ in range(len(p))]
         
         for i, pi in enumerate(p):
             if i >= len(indices):
@@ -84,9 +97,9 @@ class YOLOLoss(nn.Module):
                     pobj = ps[:, 4:5]
                     pcls = ps[:, 5:] if self.num_classes > 0 else torch.zeros_like(pobj)
                     
-                    pxy = torch.sigmoid(pxy) * 2.0 - 0.5
-                    pwh = torch.clamp((torch.sigmoid(pwh) * 2) ** 2, min=1e-6, max=1e6) * anchors[i]
-                    pbox = torch.cat((pxy, pwh), 1)
+                    pxy = torch.sigmoid(ps[:, 0:2]) * 2.0 - 0.5
+                    pwh = (torch.sigmoid(ps[:, 2:4]) * 2) ** 2 * anch[i]  
+                    pbox = torch.cat((pxy, pwh), 1)    
                     
                     iou = self.bbox_iou(pbox, tbox[i], CIoU=True).squeeze(-1)
                     iou = torch.clamp(iou, min=0.0, max=1.0)
@@ -257,14 +270,14 @@ class YOLOLoss(nn.Module):
             self.nl = num_predictions
             self.balance = [1.0] * num_predictions
     
-    def build_targets(self, p, targets):
+    def build_targets(self, p, targets, scaled_anchors):
         """Build targets with bounds checking"""
         na, nt = self.na, targets.shape[0]
         tcls, tbox, indices, anch = [], [], [], []
         gain = torch.ones(7, device=self.device)
         ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)
         targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)
-        
+
         g = 0.5
         off = torch.tensor([
             [0, 0],
@@ -272,10 +285,10 @@ class YOLOLoss(nn.Module):
         ], device=self.device).float() * g
         
         for i in range(min(self.nl, len(p))):
-            anchors = self.anchors[i] if i < len(self.anchors) else self.anchors[-1]
+            anchors = scaled_anchors[i] if i < len(scaled_anchors) else scaled_anchors[-1]
             shape = p[i].shape
-            gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]
-            
+            gain[2:6] = torch.tensor(shape, device=self.device)[[3, 2, 3, 2]]
+
             t = targets * gain
             if nt:
                 t[:, :, 2:6] = torch.clamp(t[:, :, 2:6], min=0.0, max=float(max(shape[2:4])))
