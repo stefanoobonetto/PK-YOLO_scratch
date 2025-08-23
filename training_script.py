@@ -1,3 +1,4 @@
+import os
 import time
 import torch
 import logging
@@ -16,6 +17,7 @@ from utils.utils import get_train_arg_parser
 from utils.early_stopping import EarlyStopping
 from multimodal_pk_yolo import MultimodalPKYOLO
 from brats_dataset import BraTSDataset, collate_fn
+from torch.utils.data import WeightedRandomSampler
 
 warnings.filterwarnings('ignore')
 
@@ -33,7 +35,7 @@ class Visualizer:
     def should_save(self, batch_idx: int) -> bool:
         return batch_idx % self.save_interval == 0
     
-    def decode_predictions(self, predictions, img_size=640, conf_thresh=0.05): 
+    def decode_predictions(self, predictions, img_size=640, conf_thresh=0.01): 
         """Decode YOLO predictions to bounding boxes"""
         detections = []
         
@@ -301,10 +303,36 @@ class Trainer:
             augment=self.config.get('augmentation.enabled', True)
         )
         
+        def is_positive_label(txt_path):
+            if not os.path.exists(txt_path):
+                return 0.0
+            try:
+                return 1.0 if os.path.getsize(txt_path) > 0 else 0.0  # file non vuoto => almeno 1 box
+            except:
+                return 0.0
+
+        # Costruisci la lista dei label path dal dataset (adatta se il tuo dataset espone un attributo diverso)
+        label_paths = []
+        for img_path in self.train_dataset.image_paths:  # o train_dataset.samples / train_dataset.items
+            # ricava lo slice_id togliendo "_{mod}.png" dal nome e sostituendo "images"->"labels" + ".txt"
+            name = os.path.basename(img_path)
+            slice_id = name.rsplit("_", 1)[0]  # toglie il suffisso "_t1ce.png"
+            label_paths.append(os.path.join(train_dir, "labels", slice_id + ".txt"))
+
+        weights = []
+        for p in label_paths:
+            pos = is_positive_label(p)
+            # dai più peso alle positive (es. 3x). Tieni 1x per le negative
+            weights.append(3.0 if pos > 0 else 1.0)
+
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
         self.train_loader = DataLoader(
-            self.train_dataset, batch_size=batch_size, shuffle=True,
-            collate_fn=collate_fn, num_workers=num_workers, pin_memory=pin_memory,
-            drop_last=True
+            self.train_dataset,
+            batch_size=batch_size,
+            sampler=sampler,   
+            shuffle=False,     # no shuffle, sampler
+            collate_fn=collate_fn
         )
         
         self.val_dataset = BraTSDataset(
