@@ -7,6 +7,13 @@ from albumentations.pytorch import ToTensorV2
 import logging
 from pathlib import Path
 import re
+# Limit OpenCV threads to avoid contention with PyTorch DataLoader
+try:
+    import cv2 as _cv2
+    _cv2.setNumThreads(0)
+except Exception:
+    pass
+
 
 logger = logging.getLogger(__name__)
 

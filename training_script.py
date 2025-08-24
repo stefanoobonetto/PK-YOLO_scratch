@@ -11,10 +11,34 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+from multiprocessing import freeze_support
+# ---- Stability tweaks (especially for Windows/OpenCV + PyTorch DataLoader) ----
+try:
+    import cv2
+    # Avoid OpenCV-internal multithreading deadlocks when mixed with PyTorch workers
+    cv2.setNumThreads(0)
+except Exception:
+    pass
+
+# Reduce CPU thread oversubscription; adjust as needed
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+try:
+    torch.set_num_threads(1)
+except Exception:
+    pass
+# ------------------------------------------------------------------------------
+
 
 from complete_yolo_loss import YOLOLoss
-from utils.utils import get_train_arg_parser
-from utils.early_stopping import EarlyStopping
+try:
+    from utils.utils import get_train_arg_parser
+except Exception:
+    from utils import get_train_arg_parser
+try:
+    from utils.early_stopping import EarlyStopping
+except Exception:
+    from early_stopping import EarlyStopping
 from multimodal_pk_yolo import MultimodalPKYOLO
 from brats_dataset import BraTSDataset, collate_fn
 from torch.utils.data import WeightedRandomSampler
@@ -280,7 +304,10 @@ class Trainer:
         img_size = self.config.get('model.img_size', 640)
         batch_size = self.config.get('training.batch_size', 8)
         num_workers = self.config.get('data.num_workers', 4)
-        pin_memory = self.config.get('data.pin_memory', True)
+        # Force 0 workers on Windows to avoid spawn-related hangs
+        if os.name == 'nt':
+            num_workers = 0
+        pin_memory = self.config.get('data.pin_memory', True) and (self.device.type == 'cuda')
         
         train_dir = Path(data_dir) / 'train'
         val_dir = Path(data_dir) / 'val'
@@ -312,12 +339,8 @@ class Trainer:
                 return 0.0
 
         # Costruisci la lista dei label path dal dataset (adatta se il tuo dataset espone un attributo diverso)
-        label_paths = []
-        for img_path in self.train_dataset.image_paths:  # o train_dataset.samples / train_dataset.items
-            # ricava lo slice_id togliendo "_{mod}.png" dal nome e sostituendo "images"->"labels" + ".txt"
-            name = os.path.basename(img_path)
-            slice_id = name.rsplit("_", 1)[0]  # toglie il suffisso "_t1ce.png"
-            label_paths.append(os.path.join(train_dir, "labels", slice_id + ".txt"))
+        # Build label paths using slice_ids (one label per slice)
+        label_paths = [str(Path(train_dir) / "labels" / f"{sid}.txt") for sid in self.train_dataset.slice_ids]
 
         weights = []
         for p in label_paths:
@@ -330,9 +353,12 @@ class Trainer:
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=batch_size,
-            sampler=sampler,   
-            shuffle=False,     # no shuffle, sampler
-            collate_fn=collate_fn
+            sampler=sampler,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0)
         )
         
         self.val_dataset = BraTSDataset(
@@ -346,6 +372,19 @@ class Trainer:
         
         logger.info(f"Loaded {len(self.train_dataset)} training samples")
         logger.info(f"Loaded {len(self.val_dataset)} validation samples")
+
+        # Quick sanity check: attempt to load a single sample now so failures happen early & clearly
+        try:
+            logger.info("Sanity-check: loading one training sample...")
+            _sample = self.train_dataset[0]
+            _img = _sample['image']
+            if isinstance(_img, torch.Tensor):
+                logger.info(f"Sample image tensor shape: {_img.shape}; bboxes: {len(_sample['bboxes'])}")
+            else:
+                logger.info("Sample image loaded (non-tensor).")
+        except Exception as e:
+            logger.error(f"Sanity-check failed while loading a training sample: {e}")
+            raise
         
         if len(self.train_dataset) == 0:
             raise ValueError("Training dataset is empty")
@@ -637,4 +676,5 @@ def main():
         raise
 
 if __name__ == "__main__":
+    freeze_support()
     main()
