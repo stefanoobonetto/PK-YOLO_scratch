@@ -12,22 +12,18 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 from multiprocessing import freeze_support
-# ---- Stability tweaks (especially for Windows/OpenCV + PyTorch DataLoader) ----
 try:
     import cv2
-    # Avoid OpenCV-internal multithreading deadlocks when mixed with PyTorch workers
     cv2.setNumThreads(0)
 except Exception:
     pass
 
-# Reduce CPU thread oversubscription; adjust as needed
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 try:
     torch.set_num_threads(1)
 except Exception:
     pass
-# ------------------------------------------------------------------------------
 
 
 from complete_yolo_loss import YOLOLoss
@@ -59,62 +55,129 @@ class Visualizer:
     def should_save(self, batch_idx: int) -> bool:
         return batch_idx % self.save_interval == 0
     
-    def decode_predictions(self, predictions, img_size=640, conf_thresh=0.01): 
-        """Decode YOLO predictions to bounding boxes"""
-        detections = []
-        
+    def decode_predictions(
+        self,
+        predictions,
+        img_size=640,
+        conf_thresh=0.25,         
+        iou_thresh=0.45,
+        max_dets=50
+    ):
+        """
+        Decode model outputs to normalized YOLO-style [cx, cy, w, h] + confidence.
+        Returns a list of dicts: {'bbox':[cx,cy,w,h], 'confidence':float}
+        """
+
+        import torch
+
         anchors = [
             [[10, 13], [16, 30], [33, 23]],
             [[30, 61], [62, 45], [59, 119]],
-            [[116, 90], [156, 198], [373, 326]]
+            [[116, 90], [156, 198], [373, 326]],
         ]
-        strides = [8, 16, 32]
-        
+
+        all_xyxy = []
+        all_scores = []
+
         for scale_idx, (cls_score, bbox_pred, objectness) in enumerate(predictions):
+            _, _, h, w = cls_score.shape
+            stride = float(img_size) / float(w)
+
             if scale_idx >= len(anchors):
                 continue
-                
-            batch_size, _, h, w = cls_score.shape
-            stride = strides[scale_idx]
-            # anchor -> grid units
-            scale_anchors = torch.tensor(anchors[scale_idx], device=cls_score.device, dtype=torch.float32) / float(stride)
 
-            num_anchors = 3
-            cls_score = cls_score.view(batch_size, num_anchors, 1, h, w).permute(0, 1, 3, 4, 2)
-            bbox_pred = bbox_pred.view(batch_size, num_anchors, 4, h, w).permute(0, 1, 3, 4, 2)
-            objectness = objectness.view(batch_size, num_anchors, h, w)
-            
-            cls_prob = torch.sigmoid(cls_score)
-            obj_prob = torch.sigmoid(objectness)
-            
-            for a in range(num_anchors):
-                for i in range(h):
-                    for j in range(w):
-                        obj_conf = obj_prob[0, a, i, j].item()
-                        
-                        cls_conf = cls_prob[0, a, i, j, 0].item()
-                        total_conf = obj_conf * cls_conf
-                            
-                        if total_conf > conf_thresh:  
-                            bbox = bbox_pred[0, a, i, j]
-                            
-                            xy = torch.sigmoid(bbox[0:2]) * 2.0 - 0.5
-                            wh = (torch.sigmoid(bbox[2:4]) * 2) ** 2 * scale_anchors[a]
+            B = cls_score.shape[0]
+            na = 3
+            cls_score = cls_score.view(B, na, 1, h, w).permute(0, 1, 3, 4, 2)  # (B,3,H,W,1)
+            bbox_pred = bbox_pred.view(B, na, 4, h, w).permute(0, 1, 3, 4, 2)  # (B,3,H,W,4)
+            objectness = objectness.view(B, na, h, w)                            # (B,3,H,W)
 
-                            x_center = (xy[0] + j) * stride / img_size
-                            y_center = (xy[1] + i) * stride / img_size
-                            width  = (wh[0] * stride) / float(img_size)
-                            height = (wh[1] * stride) / float(img_size)
-                            
-                            if 0.02 < width < 0.8 and 0.02 < height < 0.8:
-                                detections.append({
-                                    'bbox': [x_center.item(), y_center.item(), width.item(), height.item()],
-                                    'confidence': total_conf
-                                })
-        
-        detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)[:5]  # Max 5 pred
+            # probabilities
+            cls_prob = torch.sigmoid(cls_score)[0, ..., 0]    # (3,H,W)
+            obj_prob = torch.sigmoid(objectness)[0]           # (3,H,W)
+            conf = (cls_prob * obj_prob)                      # (3,H,W)
 
-        return detections
+            # grid and anchors (grid in (x,y) order)
+            device = cls_score.device
+            gy, gx = torch.meshgrid(
+                torch.arange(h, device=device),
+                torch.arange(w, device=device),
+                indexing='ij'
+            )  # (H,W)
+            grid = torch.stack((gx, gy), dim=-1).float()      # (H,W,2)
+
+            scale_anchors = torch.tensor(anchors[scale_idx], device=device, dtype=torch.float32) / stride  # (3,2)
+
+            # decode xywh → normalized
+            box = bbox_pred[0]                                # (3,H,W,4)
+            xy = torch.sigmoid(box[..., 0:2]) * 2.0 - 0.5     # (3,H,W,2)
+            wh = (torch.sigmoid(box[..., 2:4]) * 2.0) ** 2    # (3,H,W,2)
+            wh = wh * scale_anchors[:, None, None, :]         # multiply by anchor per a
+
+            # centers in pixels / normalized
+            cx = (xy[..., 0] + grid[..., 0]) * stride / img_size  # (3,H,W)
+            cy = (xy[..., 1] + grid[..., 1]) * stride / img_size  # (3,H,W)
+            ww = (wh[..., 0] * stride) / img_size
+            hh = (wh[..., 1] * stride) / img_size
+
+            # filter by conf and by reasonable sizes
+            mask = (conf > conf_thresh) & (ww > 0.01) & (hh > 0.01)
+            if mask.any():
+                cx = cx[mask]; cy = cy[mask]; ww = ww[mask]; hh = hh[mask]
+                scores = conf[mask]
+
+                # convert to xyxy (normalized), clamp to [0,1]
+                x1 = torch.clamp(cx - ww / 2.0, 0.0, 1.0)
+                y1 = torch.clamp(cy - hh / 2.0, 0.0, 1.0)
+                x2 = torch.clamp(cx + ww / 2.0, 0.0, 1.0)
+                y2 = torch.clamp(cy + hh / 2.0, 0.0, 1.0)
+
+                all_xyxy.append(torch.stack([x1, y1, x2, y2], dim=-1))
+                all_scores.append(scores)
+
+        if not all_xyxy:
+            return []
+
+        xyxy = torch.cat(all_xyxy, dim=0)
+        scores = torch.cat(all_scores, dim=0)
+
+        # NMS in pixel space
+        xyxy_pix = xyxy * float(img_size)
+        # Simple, dependency-free NMS
+        order = scores.argsort(descending=True)
+        keep = []
+        while order.numel() > 0:
+            i = order[0]
+            keep.append(i.item())
+            if order.numel() == 1:
+                break
+            # IoU vs remaining boxes
+            xx1 = torch.maximum(xyxy_pix[i, 0], xyxy_pix[order[1:], 0])
+            yy1 = torch.maximum(xyxy_pix[i, 1], xyxy_pix[order[1:], 1])
+            xx2 = torch.minimum(xyxy_pix[i, 2], xyxy_pix[order[1:], 2])
+            yy2 = torch.minimum(xyxy_pix[i, 3], xyxy_pix[order[1:], 3])
+            inter = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
+            area_i = (xyxy_pix[i, 2] - xyxy_pix[i, 0]).clamp(min=0) * (xyxy_pix[i, 3] - xyxy_pix[i, 1]).clamp(min=0)
+            area_r = (xyxy_pix[order[1:], 2] - xyxy_pix[order[1:], 0]).clamp(min=0) * (xyxy_pix[order[1:], 3] - xyxy_pix[order[1:], 1]).clamp(min=0)
+            iou = inter / (area_i + area_r - inter + 1e-6)
+            order = order[1:][iou <= iou_thresh]
+
+        keep = keep[:max_dets]
+
+        out = []
+        for idx in keep:
+            x1, y1, x2, y2 = xyxy[idx].tolist()
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            ww = (x2 - x1)
+            hh = (y2 - y1)
+            # extra guard
+            if ww <= 0 or hh <= 0:
+                continue
+            out.append({'bbox': [cx, cy, ww, hh], 'confidence': float(scores[idx])})
+
+        # sort by confidence and return (no hard cap to 5)
+        return sorted(out, key=lambda d: d['confidence'], reverse=True)
 
     # Fix aggiuntivo per il caricamento delle immagini nel dataset
     def load_multimodal_image(self, slice_id):
@@ -165,8 +228,14 @@ class Visualizer:
             gt_boxes = targets['bboxes'][0].detach().cpu().numpy()
             gt_labels = targets['labels'][0].detach().cpu().numpy()
             
-            pred_boxes = self.decode_predictions(predictions, img_size=img.shape[0])
-            
+            pred_boxes = self.decode_predictions(
+                predictions,
+                img_size=img.shape[0],
+                conf_thresh=0.25,
+                iou_thresh=0.45,
+                max_dets=50
+            )
+
             fig, ax = plt.subplots(figsize=(10, 10))
             ax.imshow(img, cmap='gray')
             
