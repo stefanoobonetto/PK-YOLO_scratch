@@ -7,10 +7,10 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 class DWConv(nn.Module):
-    """Depth-wise convolution"""
-    def __init__(self, dim, kernel_size=3, padding=1):
+    """Depth-wise convolution (supports stride)"""
+    def __init__(self, dim, kernel_size=3, stride=1, padding=1):
         super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size, 1, padding, groups=dim)
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size, stride, padding, groups=dim)
         nn.init.kaiming_normal_(self.dwconv.weight, mode='fan_out', nonlinearity='relu')
         if self.dwconv.bias is not None:
             nn.init.zeros_(self.dwconv.bias)
@@ -28,7 +28,7 @@ class RepViTBlock(nn.Module):
         self.conv1 = nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False)
         self.bn1 = nn.BatchNorm2d(hidden_dim)
         
-        self.dwconv = DWConv(hidden_dim)
+        self.dwconv = DWConv(hidden_dim, stride=stride)
         self.bn2 = nn.BatchNorm2d(hidden_dim)
         
         self.conv2 = nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False)
@@ -144,12 +144,23 @@ class Backbone(nn.Module):
         x = self.stem(x)
         
         feature_maps = []
+        sizes = []
         for stage_idx, stage_blocks in enumerate(self.stages):
             for block in stage_blocks:
                 x = block(x)
             
             if stage_idx >= 1:
                 feature_maps.append(x)
+                sizes.append(tuple(x.shape[-2:]))
+        
+        # One-time debug print of backbone feature sizes
+        try:
+            import logging
+            if not hasattr(self, '_sizes_logged'):
+                logging.getLogger(__name__).info(f"[Backbone] feature map sizes (H,W) per stage >=1: {sizes}")
+                self._sizes_logged = True
+        except Exception:
+            pass
         
         # Apply attention to final feature
         if len(feature_maps) > 0:
@@ -280,7 +291,17 @@ class MultimodalPKYOLO(nn.Module):
     def forward(self, x):
         features = self.backbone(x)
         fpn_features = self.neck(features)
-        fpn_features = fpn_features[-3:]  # <-- tieni solo P3,P4,P5
+        fpn_features = fpn_features[-3:]  # P3, P4, P5
+
+        try:
+            import logging
+            if not hasattr(self, '_fpn_logged'):
+                logging.getLogger(__name__).info(
+                    f"[FPN] output shapes: {[tuple(f.shape[-2:]) for f in fpn_features]}"
+                )
+                self._fpn_logged = True
+        except Exception:
+            pass
 
         predictions = []
         for feat in fpn_features:
@@ -303,7 +324,6 @@ def get_model_info(model):
     }
 
 def create_model(num_classes=1, input_channels=4, pretrained_path=None, device='cuda'):
-    """Create MultimodalPKYOLO model"""
     model = MultimodalPKYOLO(num_classes=num_classes, input_channels=input_channels)
     
     if pretrained_path and Path(pretrained_path).exists():

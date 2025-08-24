@@ -46,10 +46,11 @@ logger = logging.getLogger(__name__)
 
 class Visualizer:
     """Training visualization"""
-    def __init__(self, output_dir: str, save_interval: int = 100):
+    def __init__(self, output_dir: str, save_interval: int = 100, conf_thresh: float = 0.05):
         self.vis_dir = Path(output_dir) / 'training_visualizations'
         self.vis_dir.mkdir(parents=True, exist_ok=True)
         self.save_interval = save_interval
+        self.conf_thresh = conf_thresh
         self.batch_count = 0
     
     def should_save(self, batch_idx: int) -> bool:
@@ -231,7 +232,7 @@ class Visualizer:
             pred_boxes = self.decode_predictions(
                 predictions,
                 img_size=img.shape[0],
-                conf_thresh=0.25,
+                conf_thresh=self.conf_thresh,
                 iou_thresh=0.45,
                 max_dets=50
             )
@@ -365,7 +366,8 @@ class Trainer:
         
         self.visualizer = Visualizer(
             output_dir=str(self.output_dir),
-            save_interval=self.config.get('visualization.save_interval', 100)
+            save_interval=self.config.get('visualization.save_interval', 100),
+            conf_thresh=self.config.get('visualization.conf_thresh', 0.05)
         )
                 
     def load_datasets(self):
@@ -728,7 +730,7 @@ def main():
     config_dict = create_default_config(args)
     config = SimpleConfig(config_dict)
     
-    logger.info("MULTIMODAL PK-YOLO TRAINING")
+    logger.info("MULTIMODAL PK-YOLO TRAINING - BraTS2020 Dataset")
     logger.info(f"Data directory: {config.get('data.data_dir')}")
     logger.info(f"Output directory: {config.get('logging.output_dir')}")
     logger.info(f"Batch size: {config.get('training.batch_size')}")
