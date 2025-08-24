@@ -1,4 +1,5 @@
 import os
+import torch
 import argparse
 
 def get_train_arg_parser():
@@ -36,3 +37,13 @@ def get_model_info(model):
         'input_channels': model.input_channels,
         'num_classes': model.num_classes
     }
+    
+
+def build_grid(h: int, w: int, device: torch.device):
+    gy, gx = torch.meshgrid(
+        torch.arange(h, device=device),
+        torch.arange(w, device=device),
+        indexing='ij'
+    )  # (H,W)
+    grid = torch.stack((gx, gy), dim=-1).float()  # (H,W,2) with (x,y)
+    return grid
