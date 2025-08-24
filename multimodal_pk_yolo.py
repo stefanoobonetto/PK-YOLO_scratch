@@ -1,13 +1,13 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import logging
+import torch.nn as nn
 from pathlib import Path
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
 class DWConv(nn.Module):
-    """Depth-wise convolution (supports stride)"""
+    # Depth-wise convolution layer
     def __init__(self, dim, kernel_size=3, stride=1, padding=1):
         super().__init__()
         self.dwconv = nn.Conv2d(dim, dim, kernel_size, stride, padding, groups=dim)
@@ -19,7 +19,8 @@ class DWConv(nn.Module):
         return self.dwconv(x)
 
 class RepViTBlock(nn.Module):
-    """RepViT block with SE attention"""
+    # RepViT block with SE attention 
+    # Ao Wang et al., “RepViT: Revisiting Mobile CNN From ViT Perspective”, CVPR 2024
     def __init__(self, inp, oup, stride=1, expand_ratio=4):
         super().__init__()
         hidden_dim = int(inp * expand_ratio)
@@ -34,7 +35,7 @@ class RepViTBlock(nn.Module):
         self.conv2 = nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False)
         self.bn3 = nn.BatchNorm2d(oup)
         
-        # SE attention
+        # Jie Hu et al., “Squeeze-and-Excitation Networks”, CVPR 2018
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(oup, max(1, oup // 16), 1),
@@ -70,10 +71,11 @@ class RepViTBlock(nn.Module):
             
         return out
 
-class CrossModalAttention(nn.Module):
-    """Cross-modal attention for multimodal fusion"""
+class ChannelAttentionBlock(nn.Module):
+
     def __init__(self, channels):
         super().__init__()
+        
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Conv2d(channels, channels // 4, 1),
@@ -94,7 +96,7 @@ class CrossModalAttention(nn.Module):
         return x * attention
 
 class Backbone(nn.Module):
-    """Multimodal backbone network"""
+
     def __init__(self, input_channels=4, width_mult=1.0):
         super().__init__()
         
@@ -108,14 +110,12 @@ class Backbone(nn.Module):
         
         input_channel = int(32 * width_mult)
         
-        # Stem layer
         self.stem = nn.Sequential(
             nn.Conv2d(input_channels, input_channel, 3, 2, 1, bias=False),
             nn.BatchNorm2d(input_channel),
             nn.ReLU6(inplace=False)
         )
         
-        # Build stages
         self.stages = nn.ModuleList()
         
         for c, n, s in self.cfgs:
@@ -129,8 +129,8 @@ class Backbone(nn.Module):
             
             self.stages.append(stage_blocks)
         
-        # Cross-modal attention
-        self.cross_modal_attention = CrossModalAttention(input_channel)
+        # contribution: cross-modal attention (4 modalities)
+        self.cross_modal_attention = ChannelAttentionBlock(input_channel)
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -153,7 +153,6 @@ class Backbone(nn.Module):
                 feature_maps.append(x)
                 sizes.append(tuple(x.shape[-2:]))
         
-        # One-time debug print of backbone feature sizes
         try:
             import logging
             if not hasattr(self, '_sizes_logged'):
@@ -169,7 +168,7 @@ class Backbone(nn.Module):
         return feature_maps
 
 class FPN(nn.Module):
-    """Feature Pyramid Network"""
+    #Feature Pyramid Network
     def __init__(self, in_channels_list, out_channels=256):
         super().__init__()
         self.lateral_convs = nn.ModuleList()
@@ -192,12 +191,10 @@ class FPN(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, features):
-        # Build laterals
         laterals = []
         for i, lateral_conv in enumerate(self.lateral_convs):
             laterals.append(lateral_conv(features[i]))
         
-        # Top-down pathway
         for i in range(len(laterals) - 2, -1, -1):
             upsampled = F.interpolate(
                 laterals[i + 1], 
@@ -206,7 +203,6 @@ class FPN(nn.Module):
             )
             laterals[i] = laterals[i] + upsampled
         
-        # Apply FPN convolutions
         fpn_outs = []
         for lateral, fpn_conv in zip(laterals, self.fpn_convs):
             fpn_outs.append(fpn_conv(lateral))
@@ -214,13 +210,11 @@ class FPN(nn.Module):
         return fpn_outs
 
 class YOLOHead(nn.Module):
-    """YOLO detection head"""
     def __init__(self, num_classes=1, in_channels=256, num_anchors=3):
         super().__init__()
         self.num_classes = num_classes
         self.num_anchors = num_anchors
         
-        # Shared convolutions
         self.shared_conv = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
             nn.BatchNorm2d(in_channels),
@@ -230,7 +224,6 @@ class YOLOHead(nn.Module):
             nn.ReLU(inplace=False)
         )
         
-        # Output heads
         self.cls_head = nn.Conv2d(in_channels, num_anchors * num_classes, 1)
         self.box_head = nn.Conv2d(in_channels, num_anchors * 4, 1)
         self.obj_head = nn.Conv2d(in_channels, num_anchors, 1)
@@ -256,7 +249,6 @@ class YOLOHead(nn.Module):
         return cls_score, bbox_pred, objectness
 
 class MultimodalPKYOLO(nn.Module):
-    """Multimodal PK-YOLO model for brain tumor detection"""
     def __init__(self, num_classes=1, input_channels=4):
         super().__init__()
         
@@ -269,14 +261,12 @@ class MultimodalPKYOLO(nn.Module):
         self.neck = FPN(backbone_channels, out_channels=256)
         self.head = YOLOHead(num_classes=num_classes, in_channels=256)
         
-        # Anchors optimized for brain tumor detection
         self.anchors = torch.tensor([
             [[10, 13], [16, 30], [33, 23]],      # P3/8 - small tumors
             [[30, 61], [62, 45], [59, 119]],     # P4/16 - medium tumors  
             [[116, 90], [156, 198], [373, 326]]  # P5/32 - large tumors
         ], dtype=torch.float32)
         
-        # Hyperparameters for training
         self.hyp = {
             'box': 0.05,
             'cls': 0.5,
@@ -308,20 +298,6 @@ class MultimodalPKYOLO(nn.Module):
             cls_score, bbox_pred, objectness = self.head(feat)
             predictions.append((cls_score, bbox_pred, objectness))
         return predictions
-
-
-def get_model_info(model):
-    """Get model information"""
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    return {
-        'total_parameters': total_params,
-        'trainable_parameters': trainable_params,
-        'model_size_mb': total_params * 4 / (1024 * 1024),
-        'input_channels': model.input_channels,
-        'num_classes': model.num_classes
-    }
 
 def create_model(num_classes=1, input_channels=4, pretrained_path=None, device='cuda'):
     model = MultimodalPKYOLO(num_classes=num_classes, input_channels=input_channels)

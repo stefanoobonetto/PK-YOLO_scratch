@@ -2,7 +2,6 @@ import math
 import torch
 import logging
 import torch.nn as nn
-import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +49,6 @@ class YOLOLoss(nn.Module):
         targets_tensor = self._prepare_targets(targets)
         p = self._prepare_predictions(predictions)
         
-        # One-time shape debug
         if not hasattr(self, '_debug_calls'):
             self._debug_calls = 0
         if self._debug_calls < 6:
@@ -173,9 +171,7 @@ class YOLOLoss(nn.Module):
         
         return total_loss, loss.detach()
     
-    def bbox_iou(self, box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
-        """IoU calculation with numerical stability"""
-        
+    def bbox_iou(self, box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):        
         if xywh:
             (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
             w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
@@ -265,7 +261,6 @@ class YOLOLoss(nn.Module):
         return targets
     
     def _prepare_predictions(self, predictions):
-        """Convert predictions with validation"""
         p = []
         for i, (cls_score, bbox_pred, objectness) in enumerate(predictions):
             if torch.isnan(cls_score).any() or torch.isnan(bbox_pred).any() or torch.isnan(objectness).any():
@@ -285,13 +280,11 @@ class YOLOLoss(nn.Module):
         return p
     
     def _adjust_to_predictions(self, num_predictions):
-        """Adjust loss parameters"""
         if num_predictions != self.nl:
             self.nl = num_predictions
             self.balance = [1.0] * num_predictions
     
     def build_targets(self, p, targets, scaled_anchors):
-        """Build targets with bounds checking"""
         na, nt = self.na, targets.shape[0]
         tcls, tbox, indices, anch = [], [], [], []
         gain = torch.ones(7, device=self.device)

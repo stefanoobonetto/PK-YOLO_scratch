@@ -1,3 +1,4 @@
+import os
 import argparse
 
 def get_train_arg_parser():
@@ -15,3 +16,23 @@ def get_train_arg_parser():
     parser.add_argument('--resume', type=str, help='Path to checkpoint to resume from')
     
     return parser
+
+def is_positive_label(txt_path):
+    if not os.path.exists(txt_path):
+        return 0.0
+    try:
+        return 1.0 if os.path.getsize(txt_path) > 0 else 0.0  
+    except:
+        return 0.0
+
+def get_model_info(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    return {
+        'total_parameters': total_params,
+        'trainable_parameters': trainable_params,
+        'model_size_mb': total_params * 4 / (1024 * 1024),
+        'input_channels': model.input_channels,
+        'num_classes': model.num_classes
+    }

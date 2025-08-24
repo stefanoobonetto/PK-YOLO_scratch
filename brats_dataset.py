@@ -7,18 +7,15 @@ from albumentations.pytorch import ToTensorV2
 import logging
 from pathlib import Path
 import re
-# Limit OpenCV threads to avoid contention with PyTorch DataLoader
 try:
     import cv2 as _cv2
     _cv2.setNumThreads(0)
 except Exception:
     pass
 
-
 logger = logging.getLogger(__name__)
 
 class BraTSDataset(Dataset):
-    """BraTS2020 Dataset for multimodal brain tumor detection"""
     
     def __init__(self, data_dir, split='train', img_size=640, augment=True):
         self.data_dir = Path(data_dir)
@@ -40,7 +37,7 @@ class BraTSDataset(Dataset):
         logger.info(f"Loaded {len(self.slice_ids)} samples for {split} split")
 
     def _get_slice_ids(self):
-        """Extract unique slice identifiers from image filenames"""
+        # Extract unique slice IDs from filenames
         slice_ids = set()
         image_files = list(self.image_dir.glob('*.png'))
         
@@ -62,7 +59,6 @@ class BraTSDataset(Dataset):
         return sorted(list(slice_ids))
 
     def setup_transforms(self):
-        """Setup image transformations"""
         if self.augment:
             self.transform = A.Compose([
                 A.Resize(self.img_size, self.img_size),
@@ -89,7 +85,7 @@ class BraTSDataset(Dataset):
             ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
     def load_multimodal_image(self, slice_id):
-        """Load all 4 modalities for a given slice"""
+        # Load and stack the four modalities
         modalities = ['t1', 't1ce', 't2', 'flair']
         images = []
         
@@ -117,7 +113,7 @@ class BraTSDataset(Dataset):
         return multimodal_img
 
     def load_labels(self, slice_id):
-        """Load YOLO format labels"""
+        # Load bounding boxes and class labels from label files
         possible_label_paths = [
             self.label_dir / f"{slice_id}.txt",
             self.label_dir / f"{slice_id}.TXT",
@@ -206,7 +202,8 @@ class BraTSDataset(Dataset):
         }
 
 def collate_fn(batch):
-    """Custom collate function for variable number of bboxes"""
+    # Custom collate function 
+    # fix for variable number of boxes per image
     images = torch.stack([item['image'] for item in batch]).float()
     
     max_boxes = max(len(item['bboxes']) for item in batch)
