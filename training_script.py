@@ -24,7 +24,7 @@ try:
 except Exception:
     pass
 
-from complete_yolo_loss import YOLOLoss
+from loss import YOLOLoss
 from utils.utils import get_train_arg_parser, is_positive_label
 from utils.config import SimpleConfig
 from utils.early_stopping import EarlyStopping

@@ -51,14 +51,14 @@ class YOLOLoss(nn.Module):
         
         if not hasattr(self, '_debug_calls'):
             self._debug_calls = 0
-        if self._debug_calls < 6:
-            try:
-                import logging
-                logging.getLogger(__name__).info(
-                    f"[YOLOLoss] pred levels: {[tuple(pi.shape) for pi in p]} | targets: {tuple(targets_tensor.shape)}"
-                )
-            except Exception:
-                pass
+        # if self._debug_calls < 6:
+            # try:
+            #     import logging
+            #     logging.getLogger(__name__).info(
+            #         f"[YOLOLoss] pred levels: {[tuple(pi.shape) for pi in p]} | targets: {tuple(targets_tensor.shape)}"
+            #     )
+            # except Exception:
+            #     pass
         self._debug_calls += 1
 
         # p[i].shape = (B, na, H, W, n_outputs)
@@ -81,13 +81,13 @@ class YOLOLoss(nn.Module):
         if has_positive_samples:
             tcls, tbox, indices, anch = self.build_targets(p, targets_tensor, scaled_anchors)
             npos = sum(len(idx[0]) for idx in indices)
-            try:
-                import logging
-                logging.getLogger(__name__).info(
-                    f"[YOLOLoss] assignments per level: {[len(idx[0]) for idx in indices]} (total {npos})"
-                )
-            except Exception:
-                pass
+            # try:
+            #     import logging
+            #     logging.getLogger(__name__).info(
+            #         f"[YOLOLoss] assignments per level: {[len(idx[0]) for idx in indices]} (total {npos})"
+            #     )
+            # except Exception:
+            #     pass
             if npos == 0:
                 logger.warning("YOLOLoss: 0 positive matches this batch")
         else:

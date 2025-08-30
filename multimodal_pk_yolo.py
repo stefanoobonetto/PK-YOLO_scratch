@@ -156,7 +156,7 @@ class Backbone(nn.Module):
         try:
             import logging
             if not hasattr(self, '_sizes_logged'):
-                logging.getLogger(__name__).info(f"[Backbone] feature map sizes (H,W) per stage >=1: {sizes}")
+                # logging.getLogger(__name__).info(f"[Backbone] feature map sizes (H,W) per stage >=1: {sizes}")
                 self._sizes_logged = True
         except Exception:
             pass
@@ -286,9 +286,9 @@ class MultimodalPKYOLO(nn.Module):
         try:
             import logging
             if not hasattr(self, '_fpn_logged'):
-                logging.getLogger(__name__).info(
-                    f"[FPN] output shapes: {[tuple(f.shape[-2:]) for f in fpn_features]}"
-                )
+                # logging.getLogger(__name__).info(
+                #     f"[FPN] output shapes: {[tuple(f.shape[-2:]) for f in fpn_features]}"
+                # )
                 self._fpn_logged = True
         except Exception:
             pass
