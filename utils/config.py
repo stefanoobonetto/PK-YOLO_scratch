@@ -7,9 +7,9 @@ def create_default_config(args=None):
             'img_size': 640,
         },
         'training': {
-            'batch_size': 4,
+            'batch_size': 32,
             'num_epochs': 100,
-            'learning_rate': 0.001,
+            'learning_rate': 0.0001,
             'weight_decay': 0.0001,
             'mixed_precision': True,
             'early_stopping': True,
@@ -33,7 +33,7 @@ def create_default_config(args=None):
             'save_interval': 25
         },
         'visualization': {
-            'save_interval': 500,
+            'save_interval': 300,
         }
     }
     

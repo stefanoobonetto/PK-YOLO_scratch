@@ -7,13 +7,13 @@ python training_script.py --data_dir ./data --batch_size 1 --epochs 10 --lr 0.00
     in caso si decidesse di utilizzarlo, bisognerebbe implementare la funzione
 
 python inference.py \
-  --data_dir /path/to/brats \
-  --split val \
-  --weights /path/to/your_checkpoint.pt \
+  --data_dir BraTS2020_TrainingData \
+  --split test \
+  --weights outputs/checkpoints/final_model.pt \
   --img_size 640 \
   --batch_size 8 \
   --conf_thresh 0.25 \
   --iou_thresh 0.45 \
   --max_dets 50 \
   --save_dir ./runs/inference/exp1 \
-  --save_vis --save_interval 100
+  --save_vis --save_interval 20

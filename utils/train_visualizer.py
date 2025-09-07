@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class Visualizer:
-    def __init__(self, output_dir: str, save_interval: int = 100, conf_thresh: float = 0.05):
+    def __init__(self, output_dir: str, save_interval: int = 100, conf_thresh: float = 0.5):
         self.vis_dir = Path(output_dir) / 'training_visualizations'
         self.vis_dir.mkdir(parents=True, exist_ok=True)
         
@@ -222,17 +222,18 @@ class Visualizer:
                 x_center, y_center, width, height = pred['bbox']
                 confidence = pred['confidence']
                 
-                x1 = (x_center - width/2) * w
-                y1 = (y_center - height/2) * h
-                w_box = width * w
-                h_box = height * h
-                
-                rect = plt.Rectangle((x1, y1), w_box, h_box, 
-                                   fill=False, color='red', linewidth=2, alpha=0.8)
-                ax.add_patch(rect)
-                ax.text(x1, y1-25, f'P:{confidence:.2f}', fontsize=9, color='red', weight='bold',
-                       bbox=dict(boxstyle="round,pad=0.3", facecolor='red', alpha=0.7))
-                pred_count += 1
+                if confidence >= self.conf_thresh:
+                    x1 = (x_center - width/2) * w
+                    y1 = (y_center - height/2) * h
+                    w_box = width * w
+                    h_box = height * h
+                    
+                    rect = plt.Rectangle((x1, y1), w_box, h_box, 
+                                    fill=False, color='red', linewidth=2, alpha=0.8)
+                    ax.add_patch(rect)
+                    ax.text(x1, y1-25, f'P:{confidence:.2f}', fontsize=9, color='red', weight='bold',
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor='red', alpha=0.7))
+                    pred_count += 1
             
             legend_elements = [
                 Line2D([0], [0], color='lime', lw=3, label=f'Ground Truth ({gt_count})'),

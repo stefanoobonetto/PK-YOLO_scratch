@@ -107,7 +107,7 @@ class Trainer:
         self.visualizer = Visualizer(
             output_dir=str(self.output_dir),
             save_interval=self.config.get('visualization.save_interval', 100),
-            conf_thresh=self.config.get('visualization.conf_thresh', 0.05)
+            conf_thresh=self.config.get('visualization.conf_thresh', 0.5)
         )
                 
     def load_datasets(self):
