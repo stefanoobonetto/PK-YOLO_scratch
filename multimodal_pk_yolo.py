@@ -302,8 +302,14 @@ class MultimodalPKYOLO(nn.Module):
 def create_model(num_classes=1, input_channels=4, pretrained_path=None, device='cuda'):
     model = MultimodalPKYOLO(num_classes=num_classes, input_channels=input_channels)
     
+    print('pretrained_path:', pretrained_path)
+    print('exist pretrained_path:', Path(pretrained_path).exists() if pretrained_path else 'N/A')
     if pretrained_path and Path(pretrained_path).exists():
         checkpoint = torch.load(pretrained_path, map_location=device)
+        print('keys:', checkpoint.keys())
+        print('epoch:', checkpoint.get('epoch'))
+        print('best_loss:', checkpoint.get('best_loss'))
+
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
         else:
