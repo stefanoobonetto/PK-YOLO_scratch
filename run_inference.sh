@@ -1,0 +1,11 @@
+python inference.py \
+  --data_dir ./data \
+  --split test \
+  --weights ./outputs/checkpoints/best_model.pth \
+  --img_size 640 \
+  --batch_size 8 \
+  --conf_thresh 0.10 \
+  --iou_thresh 0.45 \
+  --max_dets 300 \
+  --save_dir ./runs_best_model/infer_t0p10 \
+  --save_vis --save_interval 20
