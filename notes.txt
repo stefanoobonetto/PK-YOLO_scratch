@@ -18,4 +18,12 @@ python inference.py --data_dir ./data \
   --max_dets 300 \
   --save_vis --save_interval 100
 
-python inference.py --data_dir ./data --weights ./outputs/checkpoints/best_model.pth --split test --save_dir runs/infer_sweep --img_size 640 --batch_size 8 --conf_sweep 0.05:0.50:0.05 --best_by ap50 --match_iou 0.50 --nms_iou 0.45 --max_dets 300 --num_classes 1 --input_channels 4
+python inference.py --data_dir ./data --weights ./outputs/checkpoints/best_model.pth --split test --save_dir runs/infer_new_repvit --img_size 640 --batch_size 8 --conf_sweep 0.05:0.50:0.05 --best_by ap50 --match_iou 0.50 --nms_iou 0.45 --max_dets 300 --num_classes 1 --input_channels 4
+
+--------------------------------------------------------------------------------------------------------------------
+
+SPARK pretrain:
+python spark_pretrain.py --data_dir ./data --epochs 300 --batch_size 16 --output_dir ./spark_outputs
+
+After SPARK pretrain run:
+python training_script.py --data_dir ./data --spark_backbone_path ./spark_outputs/best_spark_model.pth --backbone_lr_mult 0.1 --img_size 640 --batch_size 16 --epochs 300 --lr 0.001

@@ -1,3 +1,8 @@
+"""
+Modified multimodal_pk_yolo.py to support SparK pretrained backbone.
+This integrates seamlessly with your existing codebase.
+"""
+
 import torch
 import logging
 import torch.nn as nn
@@ -20,7 +25,6 @@ class DWConv(nn.Module):
 
 class RepViTBlock(nn.Module):
     # RepViT block with SE attention 
-    # Ao Wang et al., “RepViT: Revisiting Mobile CNN From ViT Perspective”, CVPR 2024
     def __init__(self, inp, oup, stride=1, expand_ratio=4):
         super().__init__()
         hidden_dim = int(inp * expand_ratio)
@@ -35,7 +39,7 @@ class RepViTBlock(nn.Module):
         self.conv2 = nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False)
         self.bn3 = nn.BatchNorm2d(oup)
         
-        # Jie Hu et al., “Squeeze-and-Excitation Networks”, CVPR 2018
+        # SE attention
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(oup, max(1, oup // 16), 1),
@@ -72,7 +76,6 @@ class RepViTBlock(nn.Module):
         return out
 
 class ChannelAttentionBlock(nn.Module):
-
     def __init__(self, channels):
         super().__init__()
         
@@ -95,9 +98,13 @@ class ChannelAttentionBlock(nn.Module):
         attention = self.fc(context)
         return x * attention
 
-class Backbone(nn.Module):
-
-    def __init__(self, input_channels=4, width_mult=1.0):
+class SparKRepViTBackbone(nn.Module):
+    """
+    RepViT backbone that can load SparK pretrained weights.
+    Compatible with your existing training pipeline.
+    """
+    
+    def __init__(self, input_channels=4, width_mult=1.0, spark_pretrained_path=None):
         super().__init__()
         
         self.cfgs = [
@@ -129,8 +136,14 @@ class Backbone(nn.Module):
             
             self.stages.append(stage_blocks)
         
-        # contribution: cross-modal attention (4 modalities)
+        # Cross-modal attention (4 modalities)
         self.cross_modal_attention = ChannelAttentionBlock(input_channel)
+        
+        # Load SparK pretrained weights if provided
+        if spark_pretrained_path and Path(spark_pretrained_path).exists():
+            self._load_spark_weights(spark_pretrained_path)
+            logger.info(f"Loaded SparK pretrained weights from {spark_pretrained_path}")
+        
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -140,26 +153,62 @@ class Backbone(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    def _load_spark_weights(self, spark_path):
+        """Load SparK pretrained weights into the backbone."""
+        try:
+            checkpoint = torch.load(spark_path, map_location='cpu')
+            
+            # Extract encoder weights from SparK model
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            else:
+                state_dict = checkpoint
+            
+            # Filter encoder weights and convert from sparse to regular convolutions
+            encoder_weights = {}
+            for key, value in state_dict.items():
+                if key.startswith('encoder.'):
+                    # Remove 'encoder.' prefix
+                    new_key = key[8:]
+                    
+                    # Convert sparse conv weights to regular conv weights
+                    if '.conv.weight' in new_key:
+                        new_key = new_key.replace('.conv.weight', '.weight')
+                    elif '.conv.bias' in new_key:
+                        new_key = new_key.replace('.conv.bias', '.bias')
+                    
+                    encoder_weights[new_key] = value
+            
+            # Load compatible weights
+            model_dict = self.state_dict()
+            pretrained_dict = {}
+            
+            for k, v in encoder_weights.items():
+                if k in model_dict and model_dict[k].shape == v.shape:
+                    pretrained_dict[k] = v
+                    logger.debug(f"Loading pretrained weight: {k}")
+                else:
+                    logger.debug(f"Skipping incompatible weight: {k}")
+            
+            model_dict.update(pretrained_dict)
+            self.load_state_dict(model_dict)
+            
+            logger.info(f"Successfully loaded {len(pretrained_dict)}/{len(encoder_weights)} pretrained weights")
+            
+        except Exception as e:
+            logger.warning(f"Failed to load SparK weights: {e}")
+            logger.info("Continuing with random initialization")
+
     def forward(self, x):
         x = self.stem(x)
         
         feature_maps = []
-        sizes = []
         for stage_idx, stage_blocks in enumerate(self.stages):
             for block in stage_blocks:
                 x = block(x)
             
             if stage_idx >= 1:
                 feature_maps.append(x)
-                sizes.append(tuple(x.shape[-2:]))
-        
-        try:
-            import logging
-            if not hasattr(self, '_sizes_logged'):
-                # logging.getLogger(__name__).info(f"[Backbone] feature map sizes (H,W) per stage >=1: {sizes}")
-                self._sizes_logged = True
-        except Exception:
-            pass
         
         # Apply attention to final feature
         if len(feature_maps) > 0:
@@ -168,7 +217,7 @@ class Backbone(nn.Module):
         return feature_maps
 
 class FPN(nn.Module):
-    #Feature Pyramid Network
+    """Feature Pyramid Network"""
     def __init__(self, in_channels_list, out_channels=256):
         super().__init__()
         self.lateral_convs = nn.ModuleList()
@@ -249,13 +298,24 @@ class YOLOHead(nn.Module):
         return cls_score, bbox_pred, objectness
 
 class MultimodalPKYOLO(nn.Module):
-    def __init__(self, num_classes=1, input_channels=4):
+    def __init__(self, num_classes=1, input_channels=4, use_spark_pretrained=False, spark_pretrained_path=None):
         super().__init__()
         
         self.num_classes = num_classes
         self.input_channels = input_channels
+        self.use_spark_pretrained = use_spark_pretrained
         
-        self.backbone = Backbone(input_channels=input_channels)
+        # Choose backbone based on configuration
+        if use_spark_pretrained:
+            self.backbone = SparKRepViTBackbone(
+                input_channels=input_channels,
+                spark_pretrained_path=spark_pretrained_path
+            )
+            logger.info("Using SparK pretrained RepViT backbone")
+        else:
+            self.backbone = Backbone(input_channels=input_channels)
+            logger.info("Using standard RepViT backbone")
+        
         backbone_channels = [64, 128, 256, 512]
         
         self.neck = FPN(backbone_channels, out_channels=256)
@@ -283,37 +343,108 @@ class MultimodalPKYOLO(nn.Module):
         fpn_features = self.neck(features)
         fpn_features = fpn_features[-3:]  # P3, P4, P5
 
-        try:
-            import logging
-            if not hasattr(self, '_fpn_logged'):
-                # logging.getLogger(__name__).info(
-                #     f"[FPN] output shapes: {[tuple(f.shape[-2:]) for f in fpn_features]}"
-                # )
-                self._fpn_logged = True
-        except Exception:
-            pass
-
         predictions = []
         for feat in fpn_features:
             cls_score, bbox_pred, objectness = self.head(feat)
             predictions.append((cls_score, bbox_pred, objectness))
         return predictions
 
-def create_model(num_classes=1, input_channels=4, pretrained_path=None, device='cuda'):
-    model = MultimodalPKYOLO(num_classes=num_classes, input_channels=input_channels)
+def create_model(num_classes=1, input_channels=4, pretrained_path=None, device='cuda', 
+                use_spark_pretrained=False, spark_pretrained_path=None):
+    """
+    Create MultimodalPKYOLO model with optional SparK pretraining.
     
-    print('pretrained_path:', pretrained_path)
-    print('exist pretrained_path:', Path(pretrained_path).exists() if pretrained_path else 'N/A')
+    Args:
+        num_classes: Number of object classes
+        input_channels: Number of input channels (4 for multimodal MRI)
+        pretrained_path: Path to pretrained model checkpoint (for full model)
+        device: Device to load model on
+        use_spark_pretrained: Whether to use SparK pretrained backbone
+        spark_pretrained_path: Path to SparK pretrained weights
+    """
+    model = MultimodalPKYOLO(
+        num_classes=num_classes, 
+        input_channels=input_channels,
+        use_spark_pretrained=use_spark_pretrained,
+        spark_pretrained_path=spark_pretrained_path
+    )
+    
+    # Load full model checkpoint if provided
     if pretrained_path and Path(pretrained_path).exists():
         checkpoint = torch.load(pretrained_path, map_location=device)
-        print('keys:', checkpoint.keys())
-        print('epoch:', checkpoint.get('epoch'))
-        print('best_loss:', checkpoint.get('best_loss'))
-
+        
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
+            logger.info(f"Loaded full model from {pretrained_path}")
+            if 'epoch' in checkpoint:
+                logger.info(f"Model was trained for {checkpoint['epoch']} epochs")
+            if 'best_loss' in checkpoint:
+                logger.info(f"Best loss: {checkpoint['best_loss']}")
         else:
             model.load_state_dict(checkpoint)
-        logger.info(f"Loaded pretrained weights from {pretrained_path}")
+            logger.info(f"Loaded model weights from {pretrained_path}")
     
     return model.to(device)
+
+class Backbone(nn.Module):
+    """Original backbone for compatibility."""
+    
+    def __init__(self, input_channels=4, width_mult=1.0):
+        super().__init__()
+        
+        self.cfgs = [
+            [32, 1, 1],   # Stage 1
+            [64, 2, 2],   # Stage 2
+            [128, 2, 2],  # Stage 3
+            [256, 2, 2],  # Stage 4
+            [512, 1, 2],  # Stage 5
+        ]
+        
+        input_channel = int(32 * width_mult)
+        
+        self.stem = nn.Sequential(
+            nn.Conv2d(input_channels, input_channel, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(input_channel),
+            nn.ReLU6(inplace=False)
+        )
+        
+        self.stages = nn.ModuleList()
+        
+        for c, n, s in self.cfgs:
+            output_channel = int(c * width_mult)
+            stage_blocks = nn.ModuleList()
+            
+            for i in range(n):
+                stride = s if i == 0 else 1
+                stage_blocks.append(RepViTBlock(input_channel, output_channel, stride))
+                input_channel = output_channel
+            
+            self.stages.append(stage_blocks)
+        
+        # Cross-modal attention (4 modalities)
+        self.cross_modal_attention = ChannelAttentionBlock(input_channel)
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        x = self.stem(x)
+        
+        feature_maps = []
+        for stage_idx, stage_blocks in enumerate(self.stages):
+            for block in stage_blocks:
+                x = block(x)
+            
+            if stage_idx >= 1:
+                feature_maps.append(x)
+        
+        # Apply attention to final feature
+        if len(feature_maps) > 0:
+            feature_maps[-1] = self.cross_modal_attention(feature_maps[-1])
+        
+        return feature_maps

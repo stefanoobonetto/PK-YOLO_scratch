@@ -1,10 +1,11 @@
-
 def create_default_config(args=None):
     config = {
         'model': {
             'num_classes': 1,
             'input_channels': 4,
             'img_size': 640,
+            'use_spark_pretrained': False,  # NEW: Enable SparK pretrained backbone
+            'spark_pretrained_path': None,  # NEW: Path to SparK pretrained weights
         },
         'training': {
             'batch_size': 32,
@@ -34,6 +35,17 @@ def create_default_config(args=None):
         },
         'visualization': {
             'save_interval': 300,
+        },
+        # NEW: SparK pretraining configuration
+        'spark': {
+            'enabled': False,
+            'pretrain_data_dir': './data/pretrain',  # Directory for SparK pretraining data
+            'pretrain_epochs': 300,
+            'pretrain_batch_size': 16,
+            'pretrain_lr': 1e-4,
+            'mask_ratio': 0.75,
+            'patch_size': 16,
+            'output_dir': './spark_outputs'
         }
     }
     
@@ -54,6 +66,12 @@ def create_default_config(args=None):
             config['data']['num_workers'] = args.workers
         if args.mixed_precision:
             config['training']['mixed_precision'] = True
+        
+        # NEW: SparK-related arguments
+        if hasattr(args, 'use_spark_pretrained') and args.use_spark_pretrained:
+            config['model']['use_spark_pretrained'] = True
+        if hasattr(args, 'spark_pretrained_path') and args.spark_pretrained_path:
+            config['model']['spark_pretrained_path'] = args.spark_pretrained_path
     
     return config
 
@@ -70,3 +88,13 @@ class SimpleConfig:
             else:
                 return default
         return value
+    
+    def set(self, key, value):
+        """Set a configuration value."""
+        keys = key.split('.')
+        config = self.config
+        for k in keys[:-1]:
+            if k not in config:
+                config[k] = {}
+            config = config[k]
+        config[keys[-1]] = value

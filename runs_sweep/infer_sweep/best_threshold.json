@@ -1,0 +1,7 @@
+{
+  "best_by": "ap50",
+  "best_threshold": 0.05,
+  "best_metric_value": 0.6338672587777129,
+  "map_global_50": 0.6517717713803644,
+  "map_global_50_95": 0.2714130316031082
+}

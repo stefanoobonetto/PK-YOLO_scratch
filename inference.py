@@ -1,31 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Inference + metric evaluator for PK-YOLO-style models.
-
-Key features
-------------
-- Runs inference over a dataset split and writes:
-  * predictions at the selected (best) threshold -> <save_dir>/predictions.jsonl
-  * per-threshold metrics sweep (Precision/Recall/F1, AP@0.50, AP@[0.50:0.95]) -> <save_dir>/metrics.csv
-  * PR-tuning table (same content, easier to plot) -> <save_dir>/pr_tuning.csv
-  * a JSON with the chosen best threshold according to --best_by -> <save_dir>/best_threshold.json
-  * optional visual overlays if --save_vis is used -> <save_dir>/vis/
-- Decouples NMS IoU from matching IoU (for metrics).
-- Computes COCO-style mAP50 and mAP50:95 using **all detections** (global, threshold-independent).
-- Also computes "thresholded AP" (AP of predictions after score >= t) to support threshold selection
-  based on AP if desired.
-- Efficient: single forward pass per image, decode once at a **very low conf**, then filter for each t.
-
-Notes
------
-* Ground-truth boxes are expected in **YOLO normalized (cx,cy,w,h)** format from the dataset.
-* Detections are decoded as YOLO normalized (cx,cy,w,h) and then converted to xyxy-normalized when computing metrics.
-* For mAP, we aggregate **all** decoded predictions (at a very low threshold, e.g. 1e-3) and compute AP by sorting by confidence.
-* Best threshold can be chosen by: F1 (default), AP50, or AP50_95 computed after thresholding predictions (see --best_by).
-
-This evaluator follows the paper's headline metrics (mAP@0.50 and mAP@[0.50:0.95]).
-"""
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -33,34 +5,24 @@ os.environ["MKL_NUM_THREADS"] = "1"
 import csv
 import json
 import math
-import time
-import argparse
 import logging
 from pathlib import Path
 from collections import defaultdict
-
+import numpy as np
 import torch
 torch.set_num_threads(1)
 from torch.utils.data import DataLoader
 
-# --- Project imports ---
 from multimodal_pk_yolo import create_model
 from brats_dataset import BraTSDataset, collate_fn
+from utils.utils import get_inference_arg_parser
 
-# utils_inference may live at top-level or under utils/
-try:
-    from utils.utils_inference import (
-        decode_yolo_predictions, save_visualization, time_synchronized
-    )
-except Exception:
-    from utils_inference import (
-        decode_yolo_predictions, save_visualization, time_synchronized
-    )
-
+from utils.utils_inference import (
+    decode_yolo_predictions, save_visualization, time_synchronized
+)
 
 # ------------------ Geometry helpers ------------------
 def cxcywh_to_xyxy_norm(b):
-    # b: [cx,cy,w,h] normalized
     cx, cy, w, h = b
     x1 = cx - w / 2.0
     y1 = cy - h / 2.0
@@ -68,9 +30,7 @@ def cxcywh_to_xyxy_norm(b):
     y2 = cy + h / 2.0
     return [x1, y1, x2, y2]
 
-
 def box_iou_xyxy_norm(a, b):
-    # a,b: [x1,y1,x2,y2] normalized [0,1]
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     inter_x1 = max(ax1, bx1); inter_y1 = max(ay1, by1)
@@ -82,15 +42,8 @@ def box_iou_xyxy_norm(a, b):
     union = area_a + area_b - inter + 1e-12
     return inter / union
 
-
 def greedy_match_dets_to_gt(pred_xyxy, pred_cls, pred_scores, gt_xyxy, gt_cls, iou_thr=0.50):
-    """
-    One-to-one greedy matching by IoU, class-aware:
-    - predictions are considered in descending score order;
-    - each GT can be matched at most once;
-    - a match is valid if IoU>=iou_thr and class matches.
-    Returns: matches indices + arrays of tp, fp, ious (per prediction in order)
-    """
+    """One-to-one greedy matching by IoU, class-aware."""
     n_pred = len(pred_xyxy)
     n_gt = len(gt_xyxy)
     used = [False] * n_gt
@@ -102,7 +55,7 @@ def greedy_match_dets_to_gt(pred_xyxy, pred_cls, pred_scores, gt_xyxy, gt_cls, i
         best_j = -1
         best_iou = 0.0
         for j in range(n_gt):
-            if used[j]:  # GT already matched
+            if used[j]:
                 continue
             if int(pred_cls[i]) != int(gt_cls[j]):
                 continue
@@ -119,38 +72,25 @@ def greedy_match_dets_to_gt(pred_xyxy, pred_cls, pred_scores, gt_xyxy, gt_cls, i
     fn = used.count(False)
     return tp, fp, fn, ious
 
-
-# ------------------ COCO AP evaluator ------------------
-import numpy as np
-
 def _ap_from_pr(rec, prec):
-    # 101-point interpolation (COCO)
     mrec = np.concatenate(([0.], rec, [1.]))
     mpre = np.concatenate(([0.], prec, [0.]))
-    # precision envelope (monotone non-increasing)
     for k in range(mpre.size - 1, 0, -1):
         mpre[k - 1] = max(mpre[k - 1], mpre[k])
     rs = np.linspace(0, 1, 101)
     p = np.array([mpre[mrec >= r].max() if np.any(mrec >= r) else 0.0 for r in rs])
     return p.mean()
 
-
 def _compute_ap_for_class_at_iou(preds_cls, gts_cls, iou=0.50):
-    """
-    preds_cls: list of (img_id, score, [x1,y1,x2,y2])
-    gts_cls: dict img_id -> list of boxes
-    """
     if len(preds_cls) == 0:
         return float("nan")
-    # Count positives
     npos = sum(len(v) for v in gts_cls.values())
     if npos == 0:
         return float("nan")
-    # Sort by score desc
+    
     preds_cls = sorted(preds_cls, key=lambda x: x[1], reverse=True)
     tp = np.zeros(len(preds_cls), dtype=np.float32)
     fp = np.zeros(len(preds_cls), dtype=np.float32)
-    # Track which GT boxes matched
     matched = {img_id: [False]*len(boxes) for img_id, boxes in gts_cls.items()}
 
     for i, (img_id, score, box) in enumerate(preds_cls):
@@ -172,17 +112,10 @@ def _compute_ap_for_class_at_iou(preds_cls, gts_cls, iou=0.50):
     prec = tp_cum / (tp_cum + fp_cum + 1e-12)
     return _ap_from_pr(rec, prec)
 
-
 def compute_map(all_preds_raw, all_gts, num_classes, iou_thresholds=None):
-    """
-    all_preds_raw: dict img_id -> list of (cls, score, [x1,y1,x2,y2])
-    all_gts:       dict img_id -> list of (cls, [x1,y1,x2,y2])
-    Returns: dict with mAP50, mAP50_95, AP_per_IoU
-    """
     if iou_thresholds is None:
         iou_thresholds = [0.50 + 0.05*k for k in range(10)]
 
-    # Prepare structures per class
     gts_per_cls = [defaultdict(list) for _ in range(num_classes)]
     preds_per_cls = [[] for _ in range(num_classes)]
     for img_id, gts in all_gts.items():
@@ -200,6 +133,7 @@ def compute_map(all_preds_raw, all_gts, num_classes, iou_thresholds=None):
             if not math.isnan(ap):
                 ap_c.append(ap)
         ap_at_iou.append(float(np.mean(ap_c)) if len(ap_c) else float("nan"))
+    
     res = {
         "mAP50": ap_at_iou[0] if len(ap_at_iou) else float("nan"),
         "mAP50_95": float(np.nanmean(ap_at_iou)) if len(ap_at_iou) else float("nan"),
@@ -207,16 +141,12 @@ def compute_map(all_preds_raw, all_gts, num_classes, iou_thresholds=None):
     }
     return res
 
-
 def compute_map_with_threshold(all_preds_raw, all_gts, num_classes, thr, iou_thresholds=None):
-    """AP computed after discarding predictions with score<thr (non-standard but useful for threshold selection)."""
     filtered = {k: [(c,s,b) for (c,s,b) in v if s >= thr] for k, v in all_preds_raw.items()}
     return compute_map(filtered, all_gts, num_classes, iou_thresholds=iou_thresholds)
 
-
 # ------------------ Arg parsing ------------------
 def parse_sweep(s):
-    """Parse --conf_sweep 'a,b,c' or 'start:end:step' into a sorted list of floats (unique)."""
     if s is None or s == "":
         return []
     s = s.strip()
@@ -225,7 +155,6 @@ def parse_sweep(s):
         a, b, step = s.split(":")
         a = float(a); b = float(b); step = float(step)
         x = a
-        # avoid floating drift
         while x <= b + 1e-9:
             vals.append(round(x, 6))
             x += step
@@ -234,54 +163,68 @@ def parse_sweep(s):
             tok = tok.strip()
             if tok:
                 vals.append(float(tok))
-    # de-dup + sort
     vals = sorted(set(vals))
     return vals
 
-
-def build_argparser():
-    p = argparse.ArgumentParser("PK-YOLO inference & evaluation", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--data_dir", type=str, required=True, help="Root dataset directory")
-    p.add_argument("--weights", type=str, required=True, help="Path to .pth/.pt weights")
-    p.add_argument("--split", type=str, default="val", choices=["train","val","test"], help="Dataset split to evaluate")
-    p.add_argument("--save_dir", type=str, default="runs/inference/exp", help="Output directory")
-    p.add_argument("--img_size", type=int, default=640)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--device", type=str, default="cuda", help="'cuda' or 'cpu'")
-    p.add_argument("--half", action="store_true", help="Run model & inputs in float16")
-    p.add_argument("--max_dets", type=int, default=300, help="Top detections per image after NMS")
-    p.add_argument("--nms_iou", type=float, default=0.45, help="IoU for NMS")
-    p.add_argument("--match_iou", type=float, default=0.50, help="IoU to match GT↔pred in metrics")
-    p.add_argument("--conf_thresh", type=float, default=0.25, help="Display/confidence threshold (used if no sweep)")
-    p.add_argument("--conf_sweep", type=str, default="", help="Comma '0.05,0.1,...' or range '0.05:0.5:0.05'. If empty, uses --conf_thresh only.")
-    p.add_argument("--best_by", type=str, default="ap50", choices=["f1","ap50","ap5095"], help="Metric used to choose best threshold from the sweep")
-    p.add_argument("--num_classes", type=int, default=1, help="Number of classes in the detector")
-    p.add_argument("--input_channels", type=int, default=4, help="Input channels (multimodal MRI = 4)")
-    p.add_argument("--save_vis", action="store_true", help="Save overlays to <save_dir>/vis")
-    p.add_argument("--vis_every", type=int, default=50, help="Visualize 1 image every N images")
-    return p
-
-
-# ------------------ Main ------------------
-def inference():
-    args = build_argparser().parse_args()
-    save_dir = Path(args.save_dir); save_dir.mkdir(parents=True, exist_ok=True)
-
-    # Logging
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-    logger = logging.getLogger("inference")
-
-    # Device
-    device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
-    half = args.half and device.type == "cuda"
-
-    # Model
-    model = create_model(num_classes=args.num_classes, input_channels=args.input_channels,
-                         pretrained_path=args.weights, device=device.type)
+def load_model_with_spark_support(weights_path, num_classes, input_channels, device, half=False):
+    """
+    Load model with automatic SparK detection from checkpoint.
+    """
+    # First, try to load checkpoint to detect SparK usage
+    checkpoint = torch.load(weights_path, map_location='cpu')
+    
+    # Check if this model uses SparK pretraining
+    use_spark_pretrained = False
+    spark_pretrained_path = None
+    
+    if 'use_spark_pretrained' in checkpoint:
+        use_spark_pretrained = checkpoint['use_spark_pretrained']
+        spark_pretrained_path = checkpoint.get('spark_pretrained_path', None)
+        logging.info(f"Detected SparK pretrained model: {use_spark_pretrained}")
+        if spark_pretrained_path:
+            logging.info(f"SparK weights path: {spark_pretrained_path}")
+    
+    # Create model with appropriate configuration
+    model = create_model(
+        num_classes=num_classes,
+        input_channels=input_channels,
+        pretrained_path=None,  # We'll load the state dict manually
+        device=device,
+        use_spark_pretrained=use_spark_pretrained,
+        spark_pretrained_path=spark_pretrained_path  # This will be used for backbone initialization
+    )
+    
+    # Load the full model state
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if 'epoch' in checkpoint:
+            logging.info(f"Loaded model from epoch {checkpoint['epoch']}")
+        if 'best_loss' in checkpoint:
+            logging.info(f"Best training loss: {checkpoint['best_loss']:.4f}")
+    else:
+        model.load_state_dict(checkpoint)
+    
     model.eval()
     if half:
         model.half()
+    
+    return model
+
+# ------------------ Main ------------------
+def inference():
+    args = get_inference_arg_parser().parse_args()
+    save_dir = Path(args.save_dir); save_dir.mkdir(parents=True, exist_ok=True)
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    logger = logging.getLogger("inference")
+
+    device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
+    half = args.half and device.type == "cuda"
+
+    # Load model with SparK support
+    model = load_model_with_spark_support(
+        args.weights, args.num_classes, args.input_channels, device.type, half=half
+    ).to(device)
 
     # Data
     ds = BraTSDataset(args.data_dir, split=args.split, img_size=args.img_size, augment=False)
@@ -303,13 +246,13 @@ def inference():
         pred_path.unlink()
 
     # Aggregators
-    all_preds_raw = defaultdict(list)   # img_id -> list[(cls, score, [x1,y1,x2,y2])]
-    all_gts = defaultdict(list)         # img_id -> list[(cls, [x1,y1,x2,y2])]
+    all_preds_raw = defaultdict(list)
+    all_gts = defaultdict(list)
     n_images = 0
     n_pos_images = 0
     t0 = time_synchronized()
 
-    # Pass 1: run model, decode **once** at low conf, aggregate preds & gts
+    # Pass 1: run model, decode once at low conf, aggregate preds & gts
     with torch.no_grad():
         for bi, batch in enumerate(dl):
             images = batch["images"].to(device, non_blocking=True)
@@ -437,7 +380,7 @@ def inference():
             best_metric_val = key_metric
             best_thr = thr
 
-    # Write metrics.csv (per-threshold rows + GLOBAL summary as first row)
+    # Write metrics.csv
     with open(metrics_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -454,13 +397,13 @@ def inference():
                 f"{r['map_global_50']:.6f}", f"{r['map_global_50_95']:.6f}"
             ])
 
-    # Also write PR tuning CSV (same as metrics but easier to ingest)
+    # Also write PR tuning CSV
     with open(pr_tuning_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
 
-    # At best threshold, write predictions.jsonl & (optionally) per-image vis already done above
+    # At best threshold, write predictions.jsonl
     with open(pred_path, "w") as out:
         for img_id, preds in all_preds_raw.items():
             # keep only detections >= best_thr
@@ -471,7 +414,7 @@ def inference():
                     cx = (x1+x2)/2.0; cy=(y1+y2)/2.0; w=(x2-x1); h=(y2-y1)
                     dets.append({"bbox":[cx,cy,w,h], "confidence":float(score), "class":int(cls_id)})
             rec = {"image_id": img_id, "detections": dets}
-            out.write(json.dumps(rec)+"\\n")
+            out.write(json.dumps(rec)+"\n")
 
     # Save best threshold info
     with open(best_thr_path, "w") as f:
@@ -480,7 +423,11 @@ def inference():
             "best_threshold": best_thr,
             "best_metric_value": best_metric_val,
             "map_global_50": map_global["mAP50"],
-            "map_global_50_95": map_global["mAP50_95"]
+            "map_global_50_95": map_global["mAP50_95"],
+            "model_info": {
+                "use_spark_pretrained": getattr(model, 'use_spark_pretrained', False),
+                "weights_path": args.weights
+            }
         }, f, indent=2)
 
     dt = time_synchronized() - t0
@@ -488,6 +435,7 @@ def inference():
     logging.info(f"GLOBAL: mAP50={map_global['mAP50']:.3f}  mAP50:95={map_global['mAP50_95']:.3f}")
     logging.info(f"Sweep thresholds: {', '.join(f'{t:.2f}' for t in thr_list)}")
     logging.info(f"Best threshold by {args.best_by}: {best_thr:.3f}  (metric={best_metric_val:.4f})")
+    logging.info(f"Model type: {'SparK pretrained' if getattr(model, 'use_spark_pretrained', False) else 'Standard'}")
     logging.info(f"metrics.csv written to: {metrics_path}")
     logging.info(f"pr_tuning.csv written to: {pr_tuning_path}")
     logging.info(f"predictions.jsonl (filtered at best threshold) written to: {pred_path}")

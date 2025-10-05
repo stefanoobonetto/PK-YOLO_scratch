@@ -26,7 +26,7 @@ except Exception:
 
 from loss import YOLOLoss
 from utils.utils import get_train_arg_parser, is_positive_label
-from utils.config import SimpleConfig
+from utils.config import SimpleConfig, create_default_config
 from utils.early_stopping import EarlyStopping
 from multimodal_pk_yolo import MultimodalPKYOLO
 from brats_dataset import BraTSDataset, collate_fn
@@ -38,36 +38,43 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class Trainer:    
+class Trainer:
     def __init__(self, config):
         self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-                
-        self.model = MultimodalPKYOLO(
-            num_classes=self.config.get('model.num_classes', 1),
-            input_channels=self.config.get('model.input_channels', 4)
-        ).float().to(self.device)
-                
+
+        # --- Device selection ---
+        requested = self.config.get('runtime.device', 'auto')
+        if requested == 'cpu':
+            self.device = torch.device('cpu')
+        elif requested == 'cuda':
+            if torch.cuda.is_available():
+                self.device = torch.device('cuda')
+            else:
+                raise RuntimeError("Config requested CUDA but torch.cuda.is_available() is False.")
+        else:  # 'auto'
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Optional: cudnn speedups
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+
+        # --- Model with SparK support ---
+        self.model = self._create_model_with_spark_support()
+
+        # --- Loss ---
         self.criterion = YOLOLoss(
             model=self.model,
             num_classes=self.config.get('model.num_classes', 1),
             autobalance=True
         )
-        
-        optimizer_type = self.config.get('optimizer.type', 'AdamW')
-        lr = self.config.get('training.learning_rate', 1e-3)
-        weight_decay = self.config.get('training.weight_decay', 1e-4)
-        
-        if optimizer_type == 'AdamW':
-            self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        elif optimizer_type == 'SGD':
-            self.optimizer = optim.SGD(self.model.parameters(), lr=lr, weight_decay=weight_decay, momentum=0.9)
-        else:
-            raise ValueError(f"Unknown optimizer: {optimizer_type}")
-        
+
+        # --- Optimizer with differential learning rates ---
+        self.optimizer = self._create_optimizer_with_differential_lr()
+
+        # --- Scheduler ---
         scheduler_type = self.config.get('optimizer.lr_scheduler', 'CosineAnnealingLR')
         num_epochs = self.config.get('training.num_epochs', 100)
-        
+
         if scheduler_type == 'CosineAnnealingLR':
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs)
         elif scheduler_type == 'ReduceLROnPlateau':
@@ -76,19 +83,17 @@ class Trainer:
             self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=30, gamma=0.1)
         else:
             self.scheduler = None
-            
+
         self.current_epoch = 0
         self.best_loss = float('inf')
-        self.train_losses = []
-        self.val_losses = []
-        self.learning_rates = []
-        
+        self.train_losses, self.val_losses, self.learning_rates = [], [], []
+
+        # --- Output dirs ---
         self.output_dir = Path(self.config.get('logging.output_dir', 'outputs'))
-        self.output_dir.mkdir(exist_ok=True)
-        
-        (self.output_dir / 'checkpoints').mkdir(exist_ok=True)
-        (self.output_dir / 'logs').mkdir(exist_ok=True)
-        
+        (self.output_dir / 'checkpoints').mkdir(parents=True, exist_ok=True)
+        (self.output_dir / 'logs').mkdir(parents=True, exist_ok=True)
+
+        # --- Early stopping ---
         if self.config.get('training.early_stopping', True):
             self.early_stopping = EarlyStopping(
                 patience=self.config.get('training.patience', 20),
@@ -96,20 +101,202 @@ class Trainer:
             )
         else:
             self.early_stopping = None
-        
+
+        # --- AMP only if CUDA is available and enabled ---
         self.scaler = None
-        if self.config.get('training.mixed_precision', False):
+        if self.device.type == 'cuda' and self.config.get('training.mixed_precision', False):
             try:
                 self.scaler = torch.cuda.amp.GradScaler()
-            except:
+            except Exception:
                 self.scaler = None
-        
+
+        # --- Visualizer ---
         self.visualizer = Visualizer(
             output_dir=str(self.output_dir),
             save_interval=self.config.get('visualization.save_interval', 100),
             conf_thresh=self.config.get('visualization.conf_thresh', 0.5)
         )
+
+        # Log model info
+        self._log_model_info()
+
+    def _create_model_with_spark_support(self):
+        """Create model with optional SparK pretrained backbone."""
+        
+        model = MultimodalPKYOLO(
+            num_classes=self.config.get('model.num_classes', 1),
+            input_channels=self.config.get('model.input_channels', 4)
+        ).float().to(self.device)
+        
+        # Load SparK pretrained backbone if specified
+        spark_backbone_path = self.config.get('model.spark_backbone_path', None)
+        if spark_backbone_path:
+            self._load_spark_backbone_weights(model, spark_backbone_path)
+        
+        return model
+    
+    def _load_spark_backbone_weights(self, model, backbone_path):
+        """Load SparK pretrained backbone weights."""
+        
+        backbone_path = Path(backbone_path)
+        if not backbone_path.exists():
+            raise FileNotFoundError(f"SparK backbone weights not found: {backbone_path}")
+        
+        logger.info(f"Loading SparK pretrained backbone from: {backbone_path}")
+        
+        try:
+            # Load backbone checkpoint
+            checkpoint = torch.load(backbone_path, map_location='cpu')
+            
+            if 'backbone_state_dict' in checkpoint:
+                backbone_weights = checkpoint['backbone_state_dict']
+                logger.info(f"Loaded backbone weights extracted from SparK model")
+            else:
+                # Try to extract from full SparK model
+                backbone_weights = self._extract_backbone_from_spark_checkpoint(checkpoint)
+            
+            # Load weights into model backbone
+            model_dict = model.state_dict()
+            loaded_weights = {}
+            
+            for key, value in backbone_weights.items():
+                # Map to backbone module
+                backbone_key = f'backbone.{key}'
                 
+                if backbone_key in model_dict:
+                    if model_dict[backbone_key].shape == value.shape:
+                        loaded_weights[backbone_key] = value
+                        logger.debug(f"Loaded: {backbone_key}")
+                    else:
+                        logger.warning(f"Shape mismatch for {backbone_key}: model={model_dict[backbone_key].shape}, checkpoint={value.shape}")
+                else:
+                    logger.debug(f"Key not found in model: {backbone_key}")
+            
+            # Update model state dict
+            model_dict.update(loaded_weights)
+            model.load_state_dict(model_dict)
+            
+            logger.info(f"Successfully loaded {len(loaded_weights)} backbone parameters from SparK weights")
+            
+            # Optionally freeze backbone
+            if self.config.get('training.freeze_backbone', False):
+                self._freeze_backbone(model)
+                logger.info("Backbone frozen - only training detection head")
+            
+        except Exception as e:
+            logger.error(f"Failed to load SparK backbone weights: {e}")
+            logger.info("Continuing with random backbone initialization")
+    
+    def _extract_backbone_from_spark_checkpoint(self, checkpoint):
+        """Extract backbone weights from full SparK model checkpoint."""
+        
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+        
+        backbone_weights = {}
+        for key, value in state_dict.items():
+            if key.startswith('encoder.'):
+                # Remove 'encoder.' prefix and convert sparse conv keys
+                new_key = key[8:]
+                
+                # Convert sparse conv weights to regular conv weights
+                if '.conv.weight' in new_key:
+                    new_key = new_key.replace('.conv.weight', '.weight')
+                elif '.conv.bias' in new_key:
+                    new_key = new_key.replace('.conv.bias', '.bias')
+                
+                backbone_weights[new_key] = value
+        
+        return backbone_weights
+    
+    def _freeze_backbone(self, model):
+        """Freeze backbone parameters."""
+        for name, param in model.named_parameters():
+            if 'backbone' in name:
+                param.requires_grad = False
+    
+    def _create_optimizer_with_differential_lr(self):
+        """Create optimizer with differential learning rates for backbone vs detection head."""
+        
+        base_lr = self.config.get('training.learning_rate', 1e-3)
+        backbone_lr_mult = self.config.get('training.backbone_lr_mult', 0.1)
+        freeze_backbone = self.config.get('training.freeze_backbone', False)
+        weight_decay = self.config.get('training.weight_decay', 1e-4)
+        optimizer_type = self.config.get('optimizer.type', 'AdamW')
+        
+        # Separate parameters
+        backbone_params = []
+        head_params = []
+        
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            
+            if 'backbone' in name:
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+        
+        # Create parameter groups
+        param_groups = []
+        
+        if backbone_params and not freeze_backbone:
+            param_groups.append({
+                'params': backbone_params,
+                'lr': base_lr * backbone_lr_mult,
+                'name': 'backbone'
+            })
+        
+        if head_params:
+            param_groups.append({
+                'params': head_params,
+                'lr': base_lr,
+                'name': 'detection_head'
+            })
+        
+        # Create optimizer
+        if optimizer_type == 'AdamW':
+            optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+        elif optimizer_type == 'SGD':
+            optimizer = optim.SGD(param_groups, weight_decay=weight_decay, momentum=0.9)
+        else:
+            raise ValueError(f"Unknown optimizer: {optimizer_type}")
+        
+        return optimizer
+    
+    def _log_model_info(self):
+        """Log detailed model information."""
+        
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+        
+        # Count backbone vs detection head parameters
+        backbone_params = sum(p.numel() for name, p in self.model.named_parameters() if 'backbone' in name)
+        head_params = total_params - backbone_params
+        
+        logger.info(f"Device: {self.device} | cuda_available={torch.cuda.is_available()} | torch={torch.__version__}")
+        logger.info(f"Total parameters: {total_params:,}")
+        logger.info(f"Trainable parameters: {trainable_params:,}")
+        if frozen_params > 0:
+            logger.info(f"Frozen parameters: {frozen_params:,}")
+        logger.info(f"Backbone parameters: {backbone_params:,}")
+        logger.info(f"Detection head parameters: {head_params:,}")
+        
+        # Log learning rates
+        for i, group in enumerate(self.optimizer.param_groups):
+            group_name = group.get('name', f'group_{i}')
+            logger.info(f"{group_name} learning rate: {group['lr']:.6f}")
+        
+        # Log SparK usage
+        spark_path = self.config.get('model.spark_backbone_path')
+        if spark_path:
+            logger.info(f"Using SparK pretrained backbone from: {spark_path}")
+        else:
+            logger.info("Using randomly initialized backbone")
+          
     def load_datasets(self):
         data_dir = self.config.get('data.data_dir', './data')
         img_size = self.config.get('model.img_size', 640)
@@ -146,10 +333,15 @@ class Trainer:
         weights = []
         for p in label_paths:
             pos = is_positive_label(p)
-            # more weight on positive samples (e.g. 3x)
             weights.append(3.0 if pos > 0 else 1.0)
 
         sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        
+        self.val_dataset = BraTSDataset(
+            data_dir, split=val_split_name, img_size=img_size, augment=False
+        )
+        
+        pin_memory = self.config.get('data.pin_memory', True) and (self.device.type == 'cuda')
 
         self.train_loader = DataLoader(
             self.train_dataset,
@@ -161,16 +353,17 @@ class Trainer:
             pin_memory=pin_memory,
             persistent_workers=(num_workers > 0)
         )
-        
-        self.val_dataset = BraTSDataset(
-            data_dir, split=val_split_name, img_size=img_size, augment=False
-        )
-        
+
         self.val_loader = DataLoader(
-            self.val_dataset, batch_size=batch_size, shuffle=False,
-            collate_fn=collate_fn, num_workers=num_workers, pin_memory=pin_memory
+            self.val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=False
         )
-        
+
         logger.info(f"Loaded {len(self.train_dataset)} training samples")
         logger.info(f"Loaded {len(self.val_dataset)} validation samples")
 
@@ -308,6 +501,10 @@ class Trainer:
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'learning_rates': self.learning_rates,
+            # SparK configuration info
+            'spark_backbone_path': self.config.get('model.spark_backbone_path'),
+            'freeze_backbone': self.config.get('training.freeze_backbone', False),
+            'backbone_lr_mult': self.config.get('training.backbone_lr_mult', 0.1),
         }
         
         checkpoint_path = self.output_dir / 'checkpoints' / filename
@@ -320,8 +517,6 @@ class Trainer:
     
     def train(self):
         logger.info("Starting training...")
-        logger.info(f"Device: {self.device}")
-        logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
         num_epochs = self.config.get('training.num_epochs', 100)
         save_interval = self.config.get('logging.save_interval', 25)
@@ -380,20 +575,48 @@ class Trainer:
             self.save_checkpoint('final_model.pth')
             logger.info(f"Training completed. Saved {self.visualizer.batch_count} visualizations")
 
-
-
 def main():
     parser = get_train_arg_parser()
+    
     args = parser.parse_args()
     
-    config = SimpleConfig()
+    config = SimpleConfig(create_default_config(args))
+
+    # Handle CLI overrides including SparK parameters
+    cli_overrides = {
+        'data.data_dir': getattr(args, 'data_dir', None),
+        'model.img_size': getattr(args, 'img_size', None),
+        'training.batch_size': getattr(args, 'batch_size', None),
+        'training.num_epochs': getattr(args, 'epochs', None),
+        'training.learning_rate': getattr(args, 'lr', None),
+        'runtime.device': getattr(args, 'device', None),
+        # SparK parameters
+        'model.spark_backbone_path': getattr(args, 'spark_backbone_path', None),
+        'training.freeze_backbone': getattr(args, 'freeze_backbone', False),
+        'training.backbone_lr_mult': getattr(args, 'backbone_lr_mult', 0.1),
+    }
+    
+    for k, v in cli_overrides.items():
+        if v is not None:
+            config.set(k, v)
     
     logger.info("======= Multimodal PK-YOLO training - BraTS2020 Dataset =======")
     logger.info(f"  - Data directory: {config.get('data.data_dir')}")
     logger.info(f"  - Output directory: {config.get('logging.output_dir')}")
     logger.info(f"  - Batch size: {config.get('training.batch_size')}")
     logger.info(f"  - Epochs: {config.get('training.num_epochs')}")
+    logger.info(f"  - Learning rate: {config.get('training.learning_rate')}")
+    logger.info(f"  - Device request: {config.get('runtime.device','auto')}")
     
+    # Log SparK configuration
+    spark_path = config.get('model.spark_backbone_path')
+    if spark_path:
+        logger.info(f"  - SparK backbone: {spark_path}")
+        logger.info(f"  - Freeze backbone: {config.get('training.freeze_backbone', False)}")
+        logger.info(f"  - Backbone LR mult: {config.get('training.backbone_lr_mult', 0.1)}")
+    else:
+        logger.info("  - Using random backbone initialization")
+
     try:
         trainer = Trainer(config)
         trainer.load_datasets()

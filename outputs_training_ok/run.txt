@@ -1,0 +1,1 @@
+python training_script.py --data_dir ./data --spark_backbone_path ./spark_outputs/best_spark_model.pth --backbone_lr_mult 0.1 --img_size 640 --batch_size 16 --epochs 300 --lr 0.001
