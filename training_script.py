@@ -68,6 +68,17 @@ class Trainer:
             autobalance=True
         )
 
+        # - Focaler‑CIoU come regressione bbox
+        self.criterion.hyp.update({
+            'reg_metric': 'focaler_ciou',
+            'focaler_d': 0.0,   # soglia bassa d
+            'focaler_u': 0.95,  # soglia alta u
+            'box': 0.05,
+            'obj': 1.0,
+            'cls': 0.0          # no class loss
+        })
+
+
         # --- Optimizer with differential learning rates ---
         self.optimizer = self._create_optimizer_with_differential_lr()
 
@@ -577,8 +588,25 @@ class Trainer:
 
 def main():
     parser = get_train_arg_parser()
-    
+
+    # === NEW: flag per abilitare/disabilitare Early Stopping ===
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '--early_stopping',
+        dest='early_stopping',
+        action='store_true',
+        help='Abilita l’early stopping (override del config)'
+    )
+    group.add_argument(
+        '--no_early_stopping',
+        dest='early_stopping',
+        action='store_false',
+        help='Disabilita l’early stopping (override del config)'
+    )
+    parser.set_defaults(early_stopping=None)  # se non passi nulla, non tocchiamo il config
+
     args = parser.parse_args()
+
     
     config = SimpleConfig(create_default_config(args))
 
@@ -594,6 +622,7 @@ def main():
         'model.spark_backbone_path': getattr(args, 'spark_backbone_path', None),
         'training.freeze_backbone': getattr(args, 'freeze_backbone', False),
         'training.backbone_lr_mult': getattr(args, 'backbone_lr_mult', 0.1),
+        'training.early_stopping': getattr(args, 'early_stopping', None)
     }
     
     for k, v in cli_overrides.items():
@@ -607,6 +636,8 @@ def main():
     logger.info(f"  - Epochs: {config.get('training.num_epochs')}")
     logger.info(f"  - Learning rate: {config.get('training.learning_rate')}")
     logger.info(f"  - Device request: {config.get('runtime.device','auto')}")
+    logger.info(f"  - Early stopping: {config.get('training.early_stopping', True)}")
+
     
     # Log SparK configuration
     spark_path = config.get('model.spark_backbone_path')
