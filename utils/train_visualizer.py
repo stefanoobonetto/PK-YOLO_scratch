@@ -25,18 +25,18 @@ class Visualizer:
     
     def should_save(self, batch_idx: int) -> bool:
         return batch_idx % self.save_interval == 0
-    
+
     def decode_predictions(
         self,
         predictions,
         img_size=640,
-        conf_thresh=0.25,         
+        conf_thresh=0.25,
         iou_thresh=0.45,
         max_dets=50
     ):
         # Decode model outputs to normalized YOLO-style [cx, cy, w, h] + confidence.
         # Returns a list of dicts: {'bbox':[cx,cy,w,h], 'confidence':float}
-        
+
         anchors = [
             [[10, 13], [16, 30], [33, 23]],
             [[30, 61], [62, 45], [59, 119]],
@@ -47,7 +47,7 @@ class Visualizer:
         all_scores = []
 
         for scale_idx, (cls_score, bbox_pred, objectness) in enumerate(predictions):
-            _, _, h, w = cls_score.shape
+            _, ch, h, w = cls_score.shape
             stride = float(img_size) / float(w)
 
             if scale_idx >= len(anchors):
@@ -55,14 +55,21 @@ class Visualizer:
 
             B = cls_score.shape[0]
             na = 3
-            cls_score = cls_score.view(B, na, 1, h, w).permute(0, 1, 3, 4, 2)  # (B,3,H,W,1)
-            bbox_pred = bbox_pred.view(B, na, 4, h, w).permute(0, 1, 3, 4, 2)  # (B,3,H,W,4)
+            # infer number of classes from channels
+            C = max(ch // na, 1)
+
+            # reshape to [B,na,H,W,C] for cls, [B,na,H,W,4] for box, [B,na,H,W] for obj
+            cls_score = cls_score.view(B, na, C, h, w).permute(0, 1, 3, 4, 2)   # (B,3,H,W,C)
+            bbox_pred = bbox_pred.view(B, na, 4, h, w).permute(0, 1, 3, 4, 2)   # (B,3,H,W,4)
             objectness = objectness.view(B, na, h, w)                            # (B,3,H,W)
 
-            # prob
-            cls_prob = torch.sigmoid(cls_score)[0, ..., 0]    # (3,H,W)
-            obj_prob = torch.sigmoid(objectness)[0]           # (3,H,W)
-            conf = (cls_prob * obj_prob)                      # (3,H,W)
+            # confidence (obj-only for single-class)
+            obj_prob = torch.sigmoid(objectness)[0]                              # (3,H,W)
+            if C <= 1:
+                conf = obj_prob                                                  # (3,H,W)
+            else:
+                cls_prob = torch.sigmoid(cls_score)[0].amax(dim=-1)             # (3,H,W) max over classes
+                conf = cls_prob * obj_prob                                      # (3,H,W)
 
             device = cls_score.device
             gy, gx = torch.meshgrid(
@@ -70,19 +77,18 @@ class Visualizer:
                 torch.arange(w, device=device),
                 indexing='ij'
             )  # (H,W)
-            
-            grid = torch.stack((gx, gy), dim=-1).float()      # (H,W,2)
+            grid = torch.stack((gx, gy), dim=-1).float()                         # (H,W,2)
 
             scale_anchors = torch.tensor(anchors[scale_idx], device=device, dtype=torch.float32) / stride  # (3,2)
 
-            box = bbox_pred[0]                                # (3,H,W,4)
-            xy = torch.sigmoid(box[..., 0:2]) * 2.0 - 0.5     # (3,H,W,2)
-            wh = (torch.sigmoid(box[..., 2:4]) * 2.0) ** 2    # (3,H,W,2)
-            wh = wh * scale_anchors[:, None, None, :]         
+            box = bbox_pred[0]                                                  # (3,H,W,4)
+            xy = torch.sigmoid(box[..., 0:2]) * 2.0 - 0.5                       # (3,H,W,2)
+            wh = (torch.sigmoid(box[..., 2:4]) * 2.0) ** 2                      # (3,H,W,2)
+            wh = wh * scale_anchors[:, None, None, :]
 
             # centers in pixels / normalized
-            cx = (xy[..., 0] + grid[..., 0]) * stride / img_size  # (3,H,W)
-            cy = (xy[..., 1] + grid[..., 1]) * stride / img_size  # (3,H,W)
+            cx = (xy[..., 0] + grid[..., 0]) * stride / img_size                # (3,H,W)
+            cy = (xy[..., 1] + grid[..., 1]) * stride / img_size                # (3,H,W)
             ww = (wh[..., 0] * stride) / img_size
             hh = (wh[..., 1] * stride) / img_size
 
@@ -139,6 +145,7 @@ class Visualizer:
             out.append({'bbox': [cx, cy, ww, hh], 'confidence': float(scores[idx])})
 
         return sorted(out, key=lambda d: d['confidence'], reverse=True)
+
 
     def load_multimodal_image(self, slice_id):
         """Load all 4 modalities"""

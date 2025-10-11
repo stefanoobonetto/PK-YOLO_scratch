@@ -181,8 +181,16 @@ class YOLOLoss(nn.Module):
             loss[2] += cls_loss * self.balance[min(i, len(self.balance)-1)]
             
             if self.autobalance:
-                self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / (obj_loss + 1e-9).item()
+                # Stabilize autobalance to avoid runaway weights when obj_loss -> 0
+                objl = float(max(obj_loss.item(), 1e-3))  # clamp to avoid blow-up
+                self.balance[i] = float(self.balance[i] * 0.9999 + 0.0001 / objl)
         
+        # renormalize balance to keep mean ~1 and clamp to [0.25, 4.0]
+        if self.autobalance and isinstance(self.balance, list) and len(self.balance) > 0:
+            b = torch.tensor(self.balance, device=self.device, dtype=torch.float32)
+            b = (b / b.mean().clamp_(min=1e-6)).clamp_(0.25, 4.0)
+            self.balance = b.detach().cpu().tolist()
+
         # applica pesi globali
         loss[0] *= self.hyp['box']
         loss[1] *= self.hyp['obj']
@@ -192,7 +200,7 @@ class YOLOLoss(nn.Module):
             if torch.isnan(loss[i]):
                 loss[i] = torch.tensor(0.1, device=self.device)
         
-        total_loss = loss.sum() * bs
+        total_loss = loss.sum()
         
         if torch.isnan(total_loss):
             total_loss = torch.tensor(1.0, device=self.device)
