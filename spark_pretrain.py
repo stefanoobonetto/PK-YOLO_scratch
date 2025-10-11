@@ -1,556 +1,239 @@
-"""
-SparK pretraining implementation for multimodal RepViT backbone.
-Optimized for 4-channel MRI data with proper sparse convolution handling.
-"""
+# spark_pretrain.py
+# SparK-style masked pretraining for RepViT backbone (PK-YOLO)
+# - Uses the exact backbone from multimodal_pk_yolo.py
+# - Random patch masks; reconstruct masked pixels
+# - Save backbone weights for later fine-tuning in PK-YOLO
+
+from __future__ import annotations
+import argparse
+from pathlib import Path
 
 import torch
-import logging
-import argparse
-import numpy as np
-from pathlib import Path
-from torch import nn, optim
-from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
 import torch.nn.functional as F
-import cv2
+from torch.utils.data import DataLoader
 
-logger = logging.getLogger(__name__)
+# --- Your project imports (keep these consistent with your repo) ---
+from multimodal_pk_yolo import MultimodalPKYOLO     # must expose .backbone
+import config as cfg                                # should contain IMG_SIZE etc.
+from brats_dataset import BratsDataset, brats_yolo_collate
 
-class SparseConv2d(nn.Module):
-    """Sparse convolution that only computes on unmasked patches."""
-    
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True, groups=1):
+
+# ------------------------------
+# Backbone factory (exact same RepViT as detector)
+# ------------------------------
+def build_repvit_backbone(device: torch.device) -> nn.Module:
+    model = MultimodalPKYOLO(cfg)
+    backbone = model.backbone
+    backbone.to(device)
+    backbone.train()
+    return backbone
+
+
+# ------------------------------
+# SparK-style Masking
+# ------------------------------
+def make_patch_mask(x: torch.Tensor, patch: int = 16, mask_ratio: float = 0.6) -> torch.Tensor:
+    """
+    Create binary mask per image with patch granularity.
+    mask=1.0 for visible (unmasked) pixels, 0.0 for masked pixels.
+    x: [B, C, H, W]
+    """
+    B, _, H, W = x.shape
+    assert H % patch == 0 and W % patch == 0, "H and W must be divisible by patch size"
+    ph, pw = H // patch, W // patch
+    total = ph * pw
+    num_mask = int(total * mask_ratio)
+
+    device = x.device
+    masks = torch.ones(B, total, device=device)
+    for i in range(B):
+        idx = torch.randperm(total, device=device)[:num_mask]
+        masks[i, idx] = 0.0
+    masks = masks.view(B, 1, ph, pw)
+    masks = F.interpolate(masks, size=(H, W), mode="nearest")  # expand patch mask to pixel mask
+    return masks  # [B, 1, H, W] in {0,1}
+
+
+# ------------------------------
+# Lightweight decoder to reconstruct image
+# ------------------------------
+class ReconstructionDecoder(nn.Module):
+    """
+    Simple multi-scale decoder. If the backbone returns a list/tuple of feature maps,
+    upsample all to input size and fuse; otherwise upsample the single feature map.
+    Output channels = 4 (T1, T1ce, T2, FLAIR).
+    """
+    def __init__(self, out_ch: int = 4, fuse: str = "concat"):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=bias, groups=groups)
-        self.stride = stride
-        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
-        self.padding = padding if isinstance(padding, tuple) else (padding, padding)
-        
-    def forward(self, x, mask=None):
-        """
-        Args:
-            x: input tensor (B, C, H, W)
-            mask: binary mask (B, 1, H, W) where 1=visible, 0=masked
-        Returns:
-            output: convolved features
-            output_mask: mask after convolution
-        """
-        if mask is None:
-            return self.conv(x), None
-        
-        # Apply convolution
-        output = self.conv(x * mask)
-        
-        # Compute output mask - a position is valid if all input positions used are valid
-        if self.stride > 1 or any(k > 1 for k in self.kernel_size):
-            # Use max pooling to downsample mask properly
-            output_mask = F.max_pool2d(
-                mask.float(), 
-                kernel_size=self.kernel_size, 
-                stride=self.stride, 
-                padding=self.padding
-            )
-        else:
-            output_mask = mask
-            
-        return output, output_mask
-
-class SparseRepViTBlock(nn.Module):
-    """RepViT block adapted for sparse operations with proper mask handling."""
-    
-    def __init__(self, inp, oup, stride=1, expand_ratio=4):
-        super().__init__()
-        hidden_dim = int(inp * expand_ratio)
-        self.identity = stride == 1 and inp == oup
-        
-        # Sparse convolutions
-        self.conv1 = SparseConv2d(inp, hidden_dim, 1, 1, 0, bias=False)
-        self.bn1 = nn.BatchNorm2d(hidden_dim)
-        
-        self.dwconv = SparseConv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False)
-        self.bn2 = nn.BatchNorm2d(hidden_dim)
-        
-        self.conv2 = SparseConv2d(hidden_dim, oup, 1, 1, 0, bias=False)
-        self.bn3 = nn.BatchNorm2d(oup)
-        
-        # SE attention (standard - applied after sparse convs)
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(oup, max(1, oup // 16), 1),
-            nn.ReLU(inplace=False),
-            nn.Conv2d(max(1, oup // 16), oup, 1),
-            nn.Sigmoid()
-        )
-        
-        self.act = nn.ReLU6(inplace=False)
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, SparseConv2d)):
-                conv_layer = m.conv if hasattr(m, 'conv') else m
-                nn.init.kaiming_normal_(conv_layer.weight, mode='fan_out', nonlinearity='relu')
-                if conv_layer.bias is not None:
-                    nn.init.zeros_(conv_layer.bias)
-
-    def forward(self, x, mask=None):
-        identity = x
-        identity_mask = mask
-        
-        # First conv block
-        out, mask = self.conv1(x, mask)
-        out = self.act(self.bn1(out))
-        
-        # Depthwise conv
-        out, mask = self.dwconv(out, mask)
-        out = self.act(self.bn2(out))
-        
-        # Final conv
-        out, mask = self.conv2(out, mask)
-        out = self.bn3(out)
-        
-        # SE attention
-        se_weight = self.se(out)
-        out = out * se_weight
-        
-        # Residual connection
-        if self.identity:
-            out = out + identity
-            
-        return out, mask
-
-class SparKEncoder(nn.Module):
-    """SparK encoder optimized for multimodal MRI."""
-    
-    def __init__(self, input_channels=4, width_mult=1.0):
-        super().__init__()
-        
-        self.cfgs = [
-            [32, 1, 1],   # Stage 1
-            [64, 2, 2],   # Stage 2  
-            [128, 2, 2],  # Stage 3
-            [256, 2, 2],  # Stage 4
-            [512, 1, 2],  # Stage 5
-        ]
-        
-        input_channel = int(32 * width_mult)
-        
-        # Stem
-        self.stem = nn.ModuleList([
-            SparseConv2d(input_channels, input_channel//2, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(input_channel//2),
-            nn.ReLU6(inplace=False),
-            SparseConv2d(input_channel//2, input_channel, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(input_channel),
-            nn.ReLU6(inplace=False)
-        ])
-        
-        # Stages
-        self.stages = nn.ModuleList()
-        for c, n, s in self.cfgs:
-            output_channel = int(c * width_mult)
-            stage_blocks = nn.ModuleList()
-            
-            for i in range(n):
-                stride = s if i == 0 else 1
-                stage_blocks.append(SparseRepViTBlock(input_channel, output_channel, stride))
-                input_channel = output_channel
-            
-            self.stages.append(stage_blocks)
-        
-        self.final_channels = input_channel
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, SparseConv2d)):
-                conv_layer = m.conv if hasattr(m, 'conv') else m
-                nn.init.kaiming_normal_(conv_layer.weight, mode='fan_out', nonlinearity='relu')
-
-    def forward(self, x, mask=None):
-        # Apply stem
-        for i, layer in enumerate(self.stem):
-            if isinstance(layer, SparseConv2d):
-                x, mask = layer(x, mask)
-            else:
-                x = layer(x)
-        
-        # Apply stages
-        for stage_blocks in self.stages:
-            for block in stage_blocks:
-                x, mask = block(x, mask)
-        
-        return x, mask
-
-class SparKDecoder(nn.Module):
-    """Lightweight decoder for SparK reconstruction."""
-    
-    def __init__(self, encoder_dim=512, output_channels=4):
-        super().__init__()
-        
-        self.decoder_layers = nn.Sequential(
-            nn.ConvTranspose2d(encoder_dim, 256, 4, 2, 1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),
+        self.fuse = fuse
+        # Small convs for channel adaptation before fusion
+        self.adapt = nn.ModuleList([nn.Conv2d(256, 128, 1), nn.Conv2d(512, 128, 1), nn.Conv2d(768, 128, 1)])
+        # Fallback 1x1 for unknown dims at runtime (will be replaced lazily)
+        self.fallback = nn.Conv2d(128, 128, 1)
+        # Final head after fusion
+        self.head = nn.Sequential(
+            nn.Conv2d(128 if fuse == "sum" else 384, 128, 3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, output_channels, 3, 1, 1)
+            nn.Conv2d(128, out_ch, 1)
         )
-        
-    def forward(self, x):
-        return self.decoder_layers(x)
 
-class SparKPretrainer(nn.Module):
-    """Complete SparK pretraining model."""
-    
-    def __init__(self, input_channels=4, mask_ratio=0.75):
-        super().__init__()
-        
-        self.mask_ratio = mask_ratio
-        self.encoder = SparKEncoder(input_channels=input_channels)
-        self.decoder = SparKDecoder(
-            encoder_dim=self.encoder.final_channels,
-            output_channels=input_channels
-        )
-        
-    def random_masking(self, x, mask_ratio=None):
-        """
-        Create random block-wise mask for input.
-        """
-        if mask_ratio is None:
-            mask_ratio = self.mask_ratio
-            
-        B, C, H, W = x.shape
-        
-        # Create block-wise mask (16x16 blocks)
-        block_size = 16
-        num_blocks_h = H // block_size
-        num_blocks_w = W // block_size
-        total_blocks = num_blocks_h * num_blocks_w
-        
-        num_masked_blocks = int(mask_ratio * total_blocks)
-        
-        # Generate mask for each sample
-        masks = []
-        for b in range(B):
-            # Random permutation of block indices
-            block_indices = torch.randperm(total_blocks)
-            visible_blocks = block_indices[num_masked_blocks:]
-            
-            # Create spatial mask
-            mask = torch.zeros(num_blocks_h, num_blocks_w, device=x.device)
-            for idx in visible_blocks:
-                i, j = idx // num_blocks_w, idx % num_blocks_w
-                mask[i, j] = 1
-            
-            # Upsample to full resolution
-            mask = mask.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
-            masks.append(mask)
-        
-        # Stack and add channel dimension
-        mask = torch.stack(masks, dim=0).unsqueeze(1)  # (B, 1, H, W)
-        
-        return mask
-    
-    def forward(self, imgs):
-        # Generate mask
-        mask = self.random_masking(imgs)
-        
-        # Encode with mask
-        encoded_features, _ = self.encoder(imgs, mask)
-        
-        # Decode to reconstruct
-        reconstruction = self.decoder(encoded_features)
-        
-        # Ensure reconstruction matches input size
-        if reconstruction.shape != imgs.shape:
-            reconstruction = F.interpolate(reconstruction, size=imgs.shape[2:], mode='bilinear', align_corners=False)
-        
-        return reconstruction, mask
+    def _adapt_any(self, feat: torch.Tensor) -> torch.Tensor:
+        c = feat.shape[1]
+        # Choose adapter by common channel sizes, else fallback
+        if c == 256:
+            return self.adapt[0](feat)
+        if c == 512:
+            return self.adapt[1](feat)
+        if c == 768:
+            return self.adapt[2](feat)
+        return self.fallback(feat)
 
-class SparKDataset(Dataset):
-    """Optimized dataset for SparK pretraining."""
-    
-    def __init__(self, data_dir, img_size=640, modalities=['t1', 't1ce', 't2', 'flair']):
-        super().__init__()
-        self.data_dir = Path(data_dir)
-        self.img_size = img_size
-        self.modalities = modalities
-        
-        # Find all available slices
-        self.slice_ids = self._find_valid_slices()
-        
-        logger.info(f"Found {len(self.slice_ids)} complete slices for SparK pretraining")
-        
-        if len(self.slice_ids) == 0:
-            raise ValueError(f"No valid slices found in {data_dir}")
-    
-    def _find_valid_slices(self):
-        """Find slices that have all required modalities."""
-        slice_ids = set()
-        
-        # Try different directory structures
-        possible_image_dirs = [
-            self.data_dir / 'images',
-            self.data_dir / 'train' / 'images',
-            self.data_dir / 'val' / 'images',
-            self.data_dir / 'test' / 'images',
-            self.data_dir
-        ]
-        
-        image_files = []
-        for img_dir in possible_image_dirs:
-            if img_dir.exists():
-                image_files.extend(list(img_dir.glob('*.png')))
-                image_files.extend(list(img_dir.glob('*.PNG')))
-        
-        # Extract slice IDs
-        for img_file in image_files:
-            filename = img_file.stem
-            for mod in self.modalities:
-                if filename.endswith(f'_{mod}'):
-                    slice_id = filename[:-len(f'_{mod}')]
-                    slice_ids.add(slice_id)
-                    break
-        
-        # Verify all modalities exist for each slice
-        valid_slices = []
-        for slice_id in slice_ids:
-            all_exist = True
-            for mod in self.modalities:
-                # Check all possible locations
-                found = False
-                for img_dir in possible_image_dirs:
-                    if img_dir.exists():
-                        possible_paths = [
-                            img_dir / f"{slice_id}_{mod}.png",
-                            img_dir / f"{slice_id}_{mod}.PNG",
-                        ]
-                        if any(p.exists() for p in possible_paths):
-                            found = True
-                            break
-                
-                if not found:
-                    all_exist = False
-                    break
-            
-            if all_exist:
-                valid_slices.append(slice_id)
-        
-        return sorted(valid_slices)
-    
-    def load_multimodal_image(self, slice_id):
-        """Load and preprocess all modalities for a slice."""
-        images = []
-        
-        # Try different directory structures
-        possible_image_dirs = [
-            self.data_dir / 'images',
-            self.data_dir / 'train' / 'images',
-            self.data_dir / 'val' / 'images',
-            self.data_dir / 'test' / 'images',
-            self.data_dir
-        ]
-        
-        for modality in self.modalities:
-            img = None
-            
-            # Search in all possible directories
-            for img_dir in possible_image_dirs:
-                if img_dir.exists():
-                    possible_paths = [
-                        img_dir / f"{slice_id}_{modality}.png",
-                        img_dir / f"{slice_id}_{modality}.PNG",
-                    ]
-                    
-                    for img_path in possible_paths:
-                        if img_path.exists():
-                            img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
-                            if img is not None:
-                                break
-                    
-                    if img is not None:
-                        break
-            
-            if img is None:
-                logger.warning(f"Could not load {modality} for {slice_id}, using zeros")
-                img = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+    def forward(self, feats, out_hw: tuple[int, int]) -> torch.Tensor:
+        H, W = out_hw
+        if isinstance(feats, (list, tuple)):
+            ups = []
+            for f in feats[-3:]:             # use deepest 3 scales if available
+                f = self._adapt_any(f)
+                f = F.interpolate(f, size=(H, W), mode="bilinear", align_corners=False)
+                ups.append(f)
+            if self.fuse == "sum":
+                fused = torch.stack(ups, dim=0).sum(0)
             else:
-                # Resize if needed
-                if img.shape[:2] != (self.img_size, self.img_size):
-                    img = cv2.resize(img, (self.img_size, self.img_size))
-            
-            images.append(img)
-        
-        # Stack and normalize
-        multimodal_img = np.stack(images, axis=0).astype(np.float32) / 255.0
-        
-        # Apply normalization
-        mean = np.array([0.485, 0.456, 0.406, 0.485])
-        std = np.array([0.229, 0.224, 0.225, 0.229])
-        
-        for i in range(4):
-            multimodal_img[i] = (multimodal_img[i] - mean[i]) / std[i]
-        
-        return multimodal_img
-    
-    def __len__(self):
-        return len(self.slice_ids)
-    
-    def __getitem__(self, idx):
-        slice_id = self.slice_ids[idx]
-        image = self.load_multimodal_image(slice_id)
-        
-        return {
-            'image': torch.from_numpy(image).float(),
-            'slice_id': slice_id
-        }
+                fused = torch.cat(ups, dim=1)
+        else:
+            f = self._adapt_any(feats)
+            fused = F.interpolate(f, size=(H, W), mode="bilinear", align_corners=False)
+        return self.head(fused)
 
-def train_spark(config):
-    """Train SparK pretraining model."""
-    
-    # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    output_dir = Path(config['output_dir'])
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    logger.info(f"Training on device: {device}")
-    
-    # Model
-    model = SparKPretrainer(
-        input_channels=4,
-        mask_ratio=config.get('mask_ratio', 0.75)
-    ).to(device)
-    
-    logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # Dataset
-    dataset = SparKDataset(
-        data_dir=config['data_dir'],
-        img_size=config.get('img_size', 640)
-    )
-    
-    if len(dataset) == 0:
-        raise ValueError("Dataset is empty - check your data directory structure")
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.get('batch_size', 16),
-        shuffle=True,
-        num_workers=config.get('num_workers', 4),
-        pin_memory=True
-    )
-    
-    # Optimizer
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config.get('learning_rate', 1e-4),
-        weight_decay=config.get('weight_decay', 0.05)
-    )
-    
-    # Scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=config.get('epochs', 300)
-    )
-    
-    # Training loop
+
+# ------------------------------
+# SparK wrapper (masked input -> backbone -> decoder -> reconstruction)
+# ------------------------------
+class SparKPretrainModel(nn.Module):
+    def __init__(self, backbone: nn.Module, out_ch: int = 4):
+        super().__init__()
+        self.backbone = backbone
+        self.decoder = ReconstructionDecoder(out_ch=out_ch)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        x:    [B, 4, H, W]  (z-scored)
+        mask: [B, 1, H, W]  (1=visible, 0=masked)
+        """
+        x_in = x * mask  # zero-out masked regions (approximate sparse conv behavior)
+        feats = self.backbone(x_in)     # list/tuple of feature maps or a single map
+        recon = self.decoder(feats, out_hw=(x.shape[-2], x.shape[-1]))  # [B, 4, H, W]
+        return recon
+
+
+# ------------------------------
+# Loss: MSE on masked pixels only
+# ------------------------------
+def masked_mse(recon: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    recon, target: [B, 4, H, W]
+    mask:          [B, 1, H, W] where 0=masked (we compute loss on these), 1=visible
+    """
+    masked_region = 1.0 - mask  # 1 on masked pixels
+    diff2 = (recon - target) ** 2
+    diff2 = diff2.mean(dim=1, keepdim=True)  # average over channels -> [B,1,H,W]
+    num = (diff2 * masked_region).sum()
+    den = masked_region.sum() + eps
+    return num / den
+
+
+# ------------------------------
+# Training Loop
+# ------------------------------
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+
+    # For masked pretraining we want *deterministic, light* transforms:
+    # use BratsDataset with training=False (resize + zscore only).
+    ds = BratsDataset(items=args.train_items, img_size=cfg.IMG_SIZE, training=False, return_raw=False)
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+                    num_workers=args.workers, pin_memory=True, collate_fn=brats_yolo_collate)
+
+    # Build backbone from your detector and wrap with SparK pretrain head
+    backbone = build_repvit_backbone(device)
+    model = SparKPretrainModel(backbone=backbone, out_ch=4).to(device)
+
+    # Optimizer (paper uses SGD; AdamW also works well for SSL)
+    if args.opt.lower() == "sgd":
+        optim = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
+    else:
+        optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     model.train()
-    best_loss = float('inf')
-    
-    logger.info(f"Starting training for {config.get('epochs', 300)} epochs")
-    
-    for epoch in range(config.get('epochs', 300)):
-        epoch_loss = 0.0
-        num_batches = 0
-        
-        for batch_idx, batch in enumerate(dataloader):
-            images = batch['image'].to(device)
-            
-            optimizer.zero_grad()
-            
-            # Forward pass
-            reconstruction, mask = model(images)
-            
-            # Compute loss (MSE on masked regions)
-            loss = F.mse_loss(reconstruction, images, reduction='none')
-            
-            # Only compute loss on masked regions
-            mask_loss = (loss * (1 - mask)).sum() / ((1 - mask).sum() + 1e-8)
-            
-            # Backward pass
-            mask_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            epoch_loss += mask_loss.item()
-            num_batches += 1
-            
-            if batch_idx % 50 == 0:
-                logger.info(f'Epoch {epoch}, Batch {batch_idx}, Loss: {mask_loss.item():.6f}')
-        
-        scheduler.step()
-        avg_loss = epoch_loss / num_batches
-        
-        logger.info(f'Epoch {epoch} completed. Average loss: {avg_loss:.6f}')
-        
-        # Save checkpoint
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'loss': avg_loss,
-            }
-            torch.save(checkpoint, output_dir / 'best_spark_model.pth')
-            logger.info(f'New best model saved with loss: {avg_loss:.6f}')
-        
-        # Regular checkpoint
-        if epoch % 50 == 0:
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'loss': avg_loss,
-            }
-            torch.save(checkpoint, output_dir / f'spark_checkpoint_epoch_{epoch}.pth')
+    global_step = 0
+    for epoch in range(args.epochs):
+        running = 0.0
+        for batch in dl:
+            imgs = batch["images"].to(device, non_blocking=True)  # [B,4,H,W], already z-scored
+            B, C, H, W = imgs.shape
 
-def main():
-    parser = argparse.ArgumentParser(description='SparK Pretraining')
-    parser.add_argument('--data_dir', type=str, required=True, help='Dataset directory')
-    parser.add_argument('--output_dir', type=str, default='./spark_outputs', help='Output directory')
-    parser.add_argument('--epochs', type=int, default=300, help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--mask_ratio', type=float, default=0.75, help='Masking ratio')
-    parser.add_argument('--img_size', type=int, default=640, help='Image size')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers')
-    
-    args = parser.parse_args()
-    
-    config = {
-        'data_dir': args.data_dir,
-        'output_dir': args.output_dir,
-        'epochs': args.epochs,
-        'batch_size': args.batch_size,
-        'learning_rate': args.learning_rate,
-        'mask_ratio': args.mask_ratio,
-        'img_size': args.img_size,
-        'num_workers': args.num_workers,
-        'weight_decay': 0.05
-    }
-    
-    logging.basicConfig(level=logging.INFO)
-    train_spark(config)
+            # Create patch mask and reconstruct masked pixels
+            mask = make_patch_mask(imgs, patch=args.patch, mask_ratio=args.mask_ratio).to(imgs.dtype)
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                recon = model(imgs, mask)              # [B,4,H,W]
+                loss = masked_mse(recon, imgs, mask)
 
-if __name__ == '__main__':
-    main()
+            optim.zero_grad(set_to_none=True)
+            if args.amp:
+                scaler = getattr(train, "_scaler", torch.cuda.amp.GradScaler())
+                scaler.scale(loss).backward()
+                scaler.step(optim)
+                scaler.update()
+                train._scaler = scaler
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                optim.step()
+
+            running += loss.item()
+            global_step += 1
+
+        avg = running / max(1, len(dl))
+        print(f"Epoch {epoch+1}/{args.epochs}  |  SparK masked MSE: {avg:.5f}")
+
+        # Save backbone weights (this is what you will load into PK-YOLO)
+        ckpt = {
+            "epoch": epoch + 1,
+            "backbone": model.backbone.state_dict(),
+            "img_size": cfg.IMG_SIZE,
+            "patch": args.patch,
+            "mask_ratio": args.mask_ratio,
+        }
+        torch.save(ckpt, out_dir / f"repvit_spark_epoch{epoch+1:03d}.pt")
+
+    print("SparK pretraining complete.")
+
+
+# ------------------------------
+# CLI
+# ------------------------------
+def get_args():
+    p = argparse.ArgumentParser("SparK pretraining for PK-YOLO's RepViT backbone")
+    p.add_argument("--train-items", type=str, required=True,
+                   help="Path to JSON/JSONL/CSV listing image paths (labels ignored).")
+    p.add_argument("--out-dir", type=str, default="checkpoints/repvit_spark")
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--opt", type=str, default="adamw", choices=["adamw", "sgd"])
+    p.add_argument("--patch", type=int, default=16, help="Mask patch size (divides IMG_SIZE).")
+    p.add_argument("--mask-ratio", type=float, default=0.6, help="Fraction of patches to mask (0-1).")
+    p.add_argument("--cpu", action="store_true")
+    p.add_argument("--amp", action="store_true", help="Enable mixed precision training")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = get_args()
+    train(args)
