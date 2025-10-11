@@ -1,12 +1,8 @@
-#!/usr/bin/env python3
 """
-Corrected SparK pretraining implementation for multimodal RepViT backbone.
+SparK pretraining implementation for multimodal RepViT backbone.
 Optimized for 4-channel MRI data with proper sparse convolution handling.
 """
 
-import os
-import math
-import time
 import torch
 import logging
 import argparse

@@ -88,8 +88,8 @@ class YOLOLoss(nn.Module):
         if has_positive_samples:
             tcls, tbox, indices, anch = self.build_targets(p, targets_tensor, scaled_anchors)
             npos = sum(x.shape[0] for x in tbox)
-            if self._debug_calls < 3:
-                logger.info(f"[YOLOLoss] matched positives in batch: {npos}")
+            # if self._debug_calls < 3:
+            #     logger.info(f"[YOLOLoss] matched positives in batch: {npos}")
         else:
             tcls = [torch.zeros(0, dtype=torch.long, device=self.device) for _ in range(len(p))]
             tbox = [torch.zeros(0, 4, device=self.device) for _ in range(len(p))]

@@ -589,28 +589,19 @@ class Trainer:
 def main():
     parser = get_train_arg_parser()
 
-    # === NEW: flag per abilitare/disabilitare Early Stopping ===
     group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        '--early_stopping',
-        dest='early_stopping',
-        action='store_true',
-        help='Abilita l’early stopping (override del config)'
-    )
     group.add_argument(
         '--no_early_stopping',
         dest='early_stopping',
         action='store_false',
-        help='Disabilita l’early stopping (override del config)'
+        help='Disactivate early stopping (override config)'
     )
-    parser.set_defaults(early_stopping=None)  # se non passi nulla, non tocchiamo il config
+    parser.set_defaults(early_stopping=None)  
 
     args = parser.parse_args()
-
     
     config = SimpleConfig(create_default_config(args))
 
-    # Handle CLI overrides including SparK parameters
     cli_overrides = {
         'data.data_dir': getattr(args, 'data_dir', None),
         'model.img_size': getattr(args, 'img_size', None),
@@ -618,7 +609,6 @@ def main():
         'training.num_epochs': getattr(args, 'epochs', None),
         'training.learning_rate': getattr(args, 'lr', None),
         'runtime.device': getattr(args, 'device', None),
-        # SparK parameters
         'model.spark_backbone_path': getattr(args, 'spark_backbone_path', None),
         'training.freeze_backbone': getattr(args, 'freeze_backbone', False),
         'training.backbone_lr_mult': getattr(args, 'backbone_lr_mult', 0.1),

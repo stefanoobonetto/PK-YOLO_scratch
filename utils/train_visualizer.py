@@ -15,13 +15,22 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class Visualizer:
-    def __init__(self, output_dir: str, save_interval: int = 100, conf_thresh: float = 0.5):
+    def __init__(self, output_dir: str, save_interval: int = 100,
+                 conf_thresh: float = 0.5, anchors=None):
         self.vis_dir = Path(output_dir) / 'training_visualizations'
         self.vis_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.save_interval = save_interval
         self.conf_thresh = conf_thresh
         self.batch_count = 0
+
+        if anchors is None:
+            anchors = [
+                [[16.2, 14.4], [41.1, 33.3], [74.1, 57.6]],      # P3
+                [[110.4, 84.0], [146.4, 107.1], [180.3, 132.6]], # P4
+                [[226.0, 129.3], [214.8, 188.8], [278.2, 173.3]] # P5
+            ]
+        self.anchors = anchors
     
     def should_save(self, batch_idx: int) -> bool:
         return batch_idx % self.save_interval == 0
@@ -37,24 +46,21 @@ class Visualizer:
         # Decode model outputs to normalized YOLO-style [cx, cy, w, h] + confidence.
         # Returns a list of dicts: {'bbox':[cx,cy,w,h], 'confidence':float}
 
-        anchors = [
-            [[10, 13], [16, 30], [33, 23]],
-            [[30, 61], [62, 45], [59, 119]],
-            [[116, 90], [156, 198], [373, 326]],
-        ]
-
         all_xyxy = []
         all_scores = []
+
+        if not predictions or any(p is None for p in predictions):
+            return []
 
         for scale_idx, (cls_score, bbox_pred, objectness) in enumerate(predictions):
             _, ch, h, w = cls_score.shape
             stride = float(img_size) / float(w)
 
-            if scale_idx >= len(anchors):
+            if scale_idx >= len(self.anchors):
                 continue
 
             B = cls_score.shape[0]
-            na = 3
+            na = len(self.anchors[scale_idx])
             # infer number of classes from channels
             C = max(ch // na, 1)
 
@@ -79,7 +85,7 @@ class Visualizer:
             )  # (H,W)
             grid = torch.stack((gx, gy), dim=-1).float()                         # (H,W,2)
 
-            scale_anchors = torch.tensor(anchors[scale_idx], device=device, dtype=torch.float32) / stride  # (3,2)
+            scale_anchors = torch.tensor(self.anchors[scale_idx], device=device, dtype=torch.float32) / stride  # (3,2)
 
             box = bbox_pred[0]                                                  # (3,H,W,4)
             xy = torch.sigmoid(box[..., 0:2]) * 2.0 - 0.5                       # (3,H,W,2)
