@@ -7,6 +7,8 @@
 from __future__ import annotations
 import argparse
 from pathlib import Path
+from tqdm.auto import tqdm
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -15,19 +17,40 @@ from torch.utils.data import DataLoader
 
 # --- Your project imports (keep these consistent with your repo) ---
 from multimodal_pk_yolo import MultimodalPKYOLO     # must expose .backbone
-import config as cfg                                # should contain IMG_SIZE etc.
-from brats_dataset import BratsDataset, brats_yolo_collate
+from utils.config import SimpleConfig, create_default_config                                # should contain IMG_SIZE etc.
+from brats_dataset import BraTSDataset, collate_fn
 
 
 # ------------------------------
 # Backbone factory (exact same RepViT as detector)
 # ------------------------------
-def build_repvit_backbone(device: torch.device) -> nn.Module:
-    model = MultimodalPKYOLO(cfg)
+# spark_pretrain.py
+def build_repvit_backbone(device: torch.device, cfg) -> nn.Module:
+    # Try common constructor signatures explicitly to avoid misbinding
+    model = None
+    last_err = None
+    for attempt in (
+        dict(cfg=cfg, input_channels=4),
+        dict(input_channels=4, cfg=cfg),
+        dict(input_channels=4),
+        dict(cfg=cfg),
+    ):
+        try:
+            model = MultimodalPKYOLO(**attempt)
+            break
+        except TypeError as e:
+            last_err = e
+    if model is None:
+        raise TypeError(
+            "Could not construct MultimodalPKYOLO with any common signature. "
+            "Please check its __init__ and ensure it accepts cfg and/or input_channels."
+        ) from last_err
+
     backbone = model.backbone
     backbone.to(device)
     backbone.train()
     return backbone
+
 
 
 # ------------------------------
@@ -147,69 +170,89 @@ def masked_mse(recon: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, ep
 # ------------------------------
 # Training Loop
 # ------------------------------
-def train(args):
+def train(args, cfg):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    img_size = cfg.get('model.img_size')
+    assert img_size % args.patch == 0, f"IMG_SIZE ({img_size}) must be divisible by patch ({args.patch})."
 
-    # For masked pretraining we want *deterministic, light* transforms:
-    # use BratsDataset with training=False (resize + zscore only).
-    ds = BratsDataset(items=args.train_items, img_size=cfg.IMG_SIZE, training=False, return_raw=False)
+    data_dir = Path(args.data_dir)
+    split = args.split
+
+    ds = BraTSDataset(
+        data_dir=data_dir,
+        split=split,
+        img_size=img_size,
+        augment=False  # pretrain: keep stable inputs
+    )
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                    num_workers=args.workers, pin_memory=True, collate_fn=brats_yolo_collate)
+                    num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
 
-    # Build backbone from your detector and wrap with SparK pretrain head
-    backbone = build_repvit_backbone(device)
+    backbone = build_repvit_backbone(device, cfg)
     model = SparKPretrainModel(backbone=backbone, out_ch=4).to(device)
 
-    # Optimizer (paper uses SGD; AdamW also works well for SSL)
-    if args.opt.lower() == "sgd":
-        optim = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
-    else:
-        optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optim = (torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
+             if args.opt.lower() == "sgd" else
+             torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4))
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    model.train()
-    global_step = 0
+    from tqdm.auto import tqdm
+    from contextlib import nullcontext
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    best_loss = float("inf")
+
     for epoch in range(args.epochs):
+        model.train()
         running = 0.0
-        for batch in dl:
-            imgs = batch["images"].to(device, non_blocking=True)  # [B,4,H,W], already z-scored
-            B, C, H, W = imgs.shape
-
-            # Create patch mask and reconstruct masked pixels
+        pbar = tqdm(dl, total=len(dl), desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
+        for batch in pbar:
+            imgs = batch["images"].to(device, non_blocking=True)
             mask = make_patch_mask(imgs, patch=args.patch, mask_ratio=args.mask_ratio).to(imgs.dtype)
-            with torch.cuda.amp.autocast(enabled=args.amp):
-                recon = model(imgs, mask)              # [B,4,H,W]
+
+            amp_ctx = torch.amp.autocast('cuda', enabled=args.amp) if torch.cuda.is_available() else nullcontext()
+            with amp_ctx:
+                recon = model(imgs, mask)
                 loss = masked_mse(recon, imgs, mask)
 
             optim.zero_grad(set_to_none=True)
             if args.amp:
-                scaler = getattr(train, "_scaler", torch.cuda.amp.GradScaler())
                 scaler.scale(loss).backward()
-                scaler.step(optim)
-                scaler.update()
-                train._scaler = scaler
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                scaler.step(optim); scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
                 optim.step()
 
             running += loss.item()
-            global_step += 1
+            pbar.set_postfix(loss=f"{loss.item():.5f}", avg=f"{running / max(1, pbar.n):.5f}")
 
         avg = running / max(1, len(dl))
-        print(f"Epoch {epoch+1}/{args.epochs}  |  SparK masked MSE: {avg:.5f}")
+        print(f"Epoch {epoch+1}/{args.epochs} | SparK masked MSE: {avg:.5f}")
 
-        # Save backbone weights (this is what you will load into PK-YOLO)
-        ckpt = {
+        ckpt_path = out_dir / f"repvit_spark_epoch{epoch+1:03d}.pt"
+        torch.save({
             "epoch": epoch + 1,
             "backbone": model.backbone.state_dict(),
-            "img_size": cfg.IMG_SIZE,
+            "img_size": img_size,
             "patch": args.patch,
             "mask_ratio": args.mask_ratio,
-        }
-        torch.save(ckpt, out_dir / f"repvit_spark_epoch{epoch+1:03d}.pt")
+            "avg_loss": avg,
+        }, ckpt_path)
+
+        # keep a copy named best_spark_model.pth
+        if avg < best_loss:
+            best_loss = avg
+            best_path = out_dir / "best_spark_model.pth"
+            torch.save({
+                "epoch": epoch + 1,
+                "backbone": model.backbone.state_dict(),
+                "img_size": img_size,
+                "patch": args.patch,
+                "mask_ratio": args.mask_ratio,
+                "avg_loss": avg,
+            }, best_path)
+            print(f"  ↳ new best: {avg:.5f}  (saved {best_path})")
 
     print("SparK pretraining complete.")
 
@@ -217,10 +260,13 @@ def train(args):
 # ------------------------------
 # CLI
 # ------------------------------
+# --- replace get_args() entirely ---
 def get_args():
     p = argparse.ArgumentParser("SparK pretraining for PK-YOLO's RepViT backbone")
-    p.add_argument("--train-items", type=str, required=True,
-                   help="Path to JSON/JSONL/CSV listing image paths (labels ignored).")
+    p.add_argument("--data-dir", type=str, required=True,
+                   help="Root of dataset containing split/images and split/labels.")
+    p.add_argument("--split", type=str, default="train", help="Dataset split (train/val)")
+
     p.add_argument("--out-dir", type=str, default="checkpoints/repvit_spark")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=16)
@@ -236,4 +282,5 @@ def get_args():
 
 if __name__ == "__main__":
     args = get_args()
-    train(args)
+    cfg = SimpleConfig(create_default_config(args))
+    train(args, cfg)

@@ -18,6 +18,7 @@ class Visualizer:
     def __init__(self, output_dir: str, save_interval: int = 100,
                  conf_thresh: float = 0.5, anchors=None):
         self.vis_dir = Path(output_dir) / 'training_visualizations'
+        print(f'Saving visualizations to {self.vis_dir}')
         self.vis_dir.mkdir(parents=True, exist_ok=True)
 
         self.save_interval = save_interval
@@ -34,7 +35,7 @@ class Visualizer:
     
     def should_save(self, batch_idx: int) -> bool:
         return batch_idx % self.save_interval == 0
-
+    
     def decode_predictions(
         self,
         predictions,
@@ -43,81 +44,134 @@ class Visualizer:
         iou_thresh=0.45,
         max_dets=50
     ):
-        # Decode model outputs to normalized YOLO-style [cx, cy, w, h] + confidence.
-        # Returns a list of dicts: {'bbox':[cx,cy,w,h], 'confidence':float}
+        """
+        Decode head outputs into YOLO-style detections for the FIRST image in the batch.
 
+        Expected per-scale format:
+            (bbox_pred, objectness)
+            - bbox_pred:  [B, na*4, H, W]  (channel-first)
+            - objectness: [B, na,   H, W]  or [B, na*1, H, W]
+
+        Returns:
+            A list of dicts sorted by confidence desc:
+                [{'bbox': [cx, cy, w, h], 'confidence': float}, ...]
+            where coordinates are normalized to [0,1].
+        """
+        # Collect boxes and scores across all scales
         all_xyxy = []
         all_scores = []
 
+        # Quick sanity checks
         if not predictions or any(p is None for p in predictions):
             return []
 
-        for scale_idx, (cls_score, bbox_pred, objectness) in enumerate(predictions):
-            _, ch, h, w = cls_score.shape
-            stride = float(img_size) / float(w)
-
-            if scale_idx >= len(self.anchors):
+        for scale_idx, scale_pred in enumerate(predictions):
+            # Unpack the two-tensor tuple
+            if not isinstance(scale_pred, (list, tuple)) or len(scale_pred) != 2:
+                logger.warning(f"Scale {scale_idx}: expected a 2-tuple (bbox_pred, objectness); got {type(scale_pred)} with len={getattr(scale_pred, '__len__', 'n/a')}")
                 continue
 
-            B = cls_score.shape[0]
+            bbox_pred, objectness = scale_pred
+
+            # Anchor sanity
+            if scale_idx >= len(self.anchors):
+                logger.warning(f"Scale {scale_idx}: no anchors defined, skipping.")
+                continue
             na = len(self.anchors[scale_idx])
-            # infer number of classes from channels
-            C = max(ch // na, 1)
 
-            # reshape to [B,na,H,W,C] for cls, [B,na,H,W,4] for box, [B,na,H,W] for obj
-            cls_score = cls_score.view(B, na, C, h, w).permute(0, 1, 3, 4, 2)   # (B,3,H,W,C)
-            bbox_pred = bbox_pred.view(B, na, 4, h, w).permute(0, 1, 3, 4, 2)   # (B,3,H,W,4)
-            objectness = objectness.view(B, na, h, w)                            # (B,3,H,W)
+            # Shape checks
+            if bbox_pred.dim() != 4:
+                logger.warning(f"Scale {scale_idx}: bbox_pred should be 4D [B, na*4, H, W], got shape {tuple(bbox_pred.shape)}")
+                continue
+            if objectness.dim() != 4:
+                logger.warning(f"Scale {scale_idx}: objectness should be 4D [B, na, H, W] or [B, na*1, H, W], got {tuple(objectness.shape)}")
+                continue
 
-            # confidence (obj-only for single-class)
-            obj_prob = torch.sigmoid(objectness)[0]                              # (3,H,W)
-            if C <= 1:
-                conf = obj_prob                                                  # (3,H,W)
-            else:
-                cls_prob = torch.sigmoid(cls_score)[0].amax(dim=-1)             # (3,H,W) max over classes
-                conf = cls_prob * obj_prob                                      # (3,H,W)
+            B, ch_box, H, W = bbox_pred.shape
+            if B < 1:
+                continue  # nothing to visualize
 
-            device = cls_score.device
+            # Expect channels = na*4 for bbox
+            if ch_box % (4 * na) != 0:
+                logger.warning(f"Scale {scale_idx}: bbox channels {ch_box} not divisible by 4*na={4*na}, skipping.")
+                continue
+
+            # Objectness channels can be na or na*1; unify to [B, na, H, W]
+            B_obj, ch_obj, H_obj, W_obj = objectness.shape
+            if (B_obj != B) or (H_obj != H) or (W_obj != W):
+                logger.warning(f"Scale {scale_idx}: objectness shape {tuple(objectness.shape)} incompatible with bbox {tuple(bbox_pred.shape)}, skipping.")
+                continue
+
+            if ch_obj % na != 0:
+                logger.warning(f"Scale {scale_idx}: objectness channels {ch_obj} not divisible by na={na}, skipping.")
+                continue
+
+            # Compute stride from feature map width (assumes square img / stride derivation)
+            stride = float(img_size) / float(W)
+
+            # Reshape:
+            #   bbox_pred -> [B, na, 4, H, W] -> [B, na, H, W, 4]
+            #   objectness -> [B, na, H, W]
+            bbox_pred = bbox_pred.view(B, na, 4, H, W).permute(0, 1, 3, 4, 2).contiguous()
+            objectness = objectness.view(B, na, H, W)
+
+            # Use first image in batch
+            box = bbox_pred[0]            # (na, H, W, 4)
+            obj = objectness[0]           # (na, H, W)
+
+            # Confidence = sigmoid(objectness)
+            conf = torch.sigmoid(obj)     # (na, H, W)
+
+            device = bbox_pred.device
             gy, gx = torch.meshgrid(
-                torch.arange(h, device=device),
-                torch.arange(w, device=device),
+                torch.arange(H, device=device),
+                torch.arange(W, device=device),
                 indexing='ij'
-            )  # (H,W)
-            grid = torch.stack((gx, gy), dim=-1).float()                         # (H,W,2)
+            )  # (H, W)
+            grid = torch.stack((gx, gy), dim=-1).float()  # (H, W, 2)
 
-            scale_anchors = torch.tensor(self.anchors[scale_idx], device=device, dtype=torch.float32) / stride  # (3,2)
+            # Anchors for this scale (pixels), scaled to feature map units
+            scale_anchors = torch.tensor(self.anchors[scale_idx], device=device, dtype=torch.float32) / stride  # (na, 2)
 
-            box = bbox_pred[0]                                                  # (3,H,W,4)
-            xy = torch.sigmoid(box[..., 0:2]) * 2.0 - 0.5                       # (3,H,W,2)
-            wh = (torch.sigmoid(box[..., 2:4]) * 2.0) ** 2                      # (3,H,W,2)
-            wh = wh * scale_anchors[:, None, None, :]
+            # Decode:
+            #   xy:   sigmoid * 2 - 0.5 (YOLOv5-style)
+            #   wh:   (sigmoid * 2)**2 * anchor
+            xy = torch.sigmoid(box[..., 0:2]) * 2.0 - 0.5         # (na, H, W, 2)
+            wh = (torch.sigmoid(box[..., 2:4]) * 2.0) ** 2        # (na, H, W, 2)
+            wh = wh * scale_anchors[:, None, None, :]             # broadcast (na, 1, 1, 2)
 
-            # centers in pixels / normalized
-            cx = (xy[..., 0] + grid[..., 0]) * stride / img_size                # (3,H,W)
-            cy = (xy[..., 1] + grid[..., 1]) * stride / img_size                # (3,H,W)
+            # Convert to normalized centers and sizes
+            # (grid is in feature coords; add xy then scale by stride, finally normalize by img_size)
+            cx = (xy[..., 0] + grid[..., 0]) * stride / img_size  # (na, H, W)
+            cy = (xy[..., 1] + grid[..., 1]) * stride / img_size
             ww = (wh[..., 0] * stride) / img_size
             hh = (wh[..., 1] * stride) / img_size
 
-            mask = (conf > conf_thresh) & (ww > 0.01) & (hh > 0.01)
+            # Filter by confidence and small sizes
+            mask = (conf > conf_thresh) & (ww > 0.01) & (hh > 0.01)  # (na, H, W)
             if mask.any():
+                # Gather selected boxes and scores
                 cx = cx[mask]; cy = cy[mask]; ww = ww[mask]; hh = hh[mask]
                 scores = conf[mask]
 
-                # convert to xyxy (normalized), clamp to [0,1]
+                # Convert to xyxy normalized, clamp to [0,1]
                 x1 = torch.clamp(cx - ww / 2.0, 0.0, 1.0)
                 y1 = torch.clamp(cy - hh / 2.0, 0.0, 1.0)
                 x2 = torch.clamp(cx + ww / 2.0, 0.0, 1.0)
                 y2 = torch.clamp(cy + hh / 2.0, 0.0, 1.0)
 
-                all_xyxy.append(torch.stack([x1, y1, x2, y2], dim=-1))
+                all_xyxy.append(torch.stack([x1, y1, x2, y2], dim=-1))  # (N, 4)
                 all_scores.append(scores)
 
+        # Nothing kept
         if not all_xyxy:
             return []
 
-        xyxy = torch.cat(all_xyxy, dim=0)
-        scores = torch.cat(all_scores, dim=0)
+        # Concatenate over scales
+        xyxy = torch.cat(all_xyxy, dim=0)      # (M, 4), normalized
+        scores = torch.cat(all_scores, dim=0)  # (M,)
 
+        # Greedy NMS in pixel space
         xyxy_pix = xyxy * float(img_size)
         order = scores.argsort(descending=True)
         keep = []
@@ -126,19 +180,22 @@ class Visualizer:
             keep.append(i.item())
             if order.numel() == 1:
                 break
-            # IoU vs remaining boxes
+
             xx1 = torch.maximum(xyxy_pix[i, 0], xyxy_pix[order[1:], 0])
             yy1 = torch.maximum(xyxy_pix[i, 1], xyxy_pix[order[1:], 1])
             xx2 = torch.minimum(xyxy_pix[i, 2], xyxy_pix[order[1:], 2])
             yy2 = torch.minimum(xyxy_pix[i, 3], xyxy_pix[order[1:], 3])
+
             inter = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
             area_i = (xyxy_pix[i, 2] - xyxy_pix[i, 0]).clamp(min=0) * (xyxy_pix[i, 3] - xyxy_pix[i, 1]).clamp(min=0)
             area_r = (xyxy_pix[order[1:], 2] - xyxy_pix[order[1:], 0]).clamp(min=0) * (xyxy_pix[order[1:], 3] - xyxy_pix[order[1:], 1]).clamp(min=0)
+
             iou = inter / (area_i + area_r - inter + 1e-6)
             order = order[1:][iou <= iou_thresh]
 
         keep = keep[:max_dets]
 
+        # Build output
         out = []
         for idx in keep:
             x1, y1, x2, y2 = xyxy[idx].tolist()
@@ -151,7 +208,6 @@ class Visualizer:
             out.append({'bbox': [cx, cy, ww, hh], 'confidence': float(scores[idx])})
 
         return sorted(out, key=lambda d: d['confidence'], reverse=True)
-
 
     def load_multimodal_image(self, slice_id):
         """Load all 4 modalities"""

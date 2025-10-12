@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class Trainer:
-    def __init__(self, config):
+    def __init__(self, config, run_output_dir=None):
         self.config = config
         self.device = self.setup_device()
 
@@ -57,7 +57,11 @@ class Trainer:
         self.best_loss = float('inf')
         self.train_losses, self.val_losses, self.learning_rates = [], [], []
         
-        self.output_dir = Path(self.config.get('logging.output_dir', 'outputs'))
+        if run_output_dir is not None:
+            self.output_dir = Path(run_output_dir)
+        else:
+            self.output_dir = Path(self.config.get('logging.output_dir', 'outputs'))
+
         (self.output_dir / 'checkpoints').mkdir(parents=True, exist_ok=True)
         
         # Early stopping
@@ -442,11 +446,16 @@ def main():
     
     config = SimpleConfig(create_default_config(args))
     
+    effective_out_dir = getattr(args, 'output_dir', None) or config.get('logging.output_dir', 'outputs')
+    logger.info(f"Effective output dir (used by Visualizer & checkpoints): {effective_out_dir}")
+     
+
+
     logger.info("=" * 60)
     logger.info("Multimodal PK-YOLO Training")
     logger.info("=" * 60)
     logger.info(f"Data dir: {config.get('data.data_dir')}")
-    logger.info(f"Output dir: {config.get('logging.output_dir')}")
+    logger.info(f"Output dir: {effective_out_dir}")
     logger.info(f"Batch size: {config.get('training.batch_size')}")
     logger.info(f"Epochs: {config.get('training.num_epochs')}")
     logger.info(f"Learning rate: {config.get('training.learning_rate')}")
@@ -459,7 +468,7 @@ def main():
         logger.info(f"Freeze backbone: {config.get('training.freeze_backbone')}")
     
     # Train
-    trainer = Trainer(config)
+    trainer = Trainer(config, run_output_dir=effective_out_dir)
     trainer.load_datasets()
     trainer.train()
 
