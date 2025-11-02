@@ -1,351 +1,252 @@
-import math
 import torch
-import logging
 import torch.nn as nn
-
-logger = logging.getLogger(__name__)
-
+import math
 
 class YOLOLoss(nn.Module):
-    """YOLO detection loss with Focaler-IoU (PK-YOLO paper). Single-class detection only."""
+    """Optimized YOLO loss for small tumor detection."""
     
-    def __init__(self, model, anchors=None, autobalance=False, img_size=640):
+    def __init__(self, model, anchors=None, img_size=640):
         super().__init__()
         
-        device = next(model.parameters()).device
-        self.device = device
+        self.device = next(model.parameters()).device
         self.img_size = img_size
         
-        # Loss hyperparameters
+        # Optimized hyperparameters for small objects
         self.hyp = {
-            'box': 0.05,
-            'obj': 1.0,
-            'anchor_t': 4.0,
-            'reg_metric': 'focal_ciou',
-            'focal_gamma': 1.5,
-            'focaler_d': 0.0,
-            'focaler_u': 0.95
+            'box': 0.1,          # Increased for better localization
+            'obj': 1.0,          # Standard objectness weight
+            'obj_pw': 1.5,       # Positive weight for objectness (handle imbalance)
+            'anchor_t': 3.0,     # Stricter anchor matching for small objects
+            'fl_gamma': 1.5,     # Focal loss gamma
         }
-            
+        
+        # Focal loss for objectness (handles imbalance)
         self.BCEobj = nn.BCEWithLogitsLoss(reduction='none')
         
-        # Anchors optimized for Brats dataset ()
+        # Optimized anchors for small tumors
         if anchors is None:
             self.anchors = torch.tensor([
-                [[16.2, 14.4], [41.1, 33.3], [74.1, 57.6]],       
-                [[110.4, 84.0], [146.4, 107.1], [180.3, 132.6]],   
-                [[226.0, 129.3], [214.8, 188.8], [278.2, 173.3]] 
-            ], dtype=torch.float32).view(3, 3, 2)
+                # P2 - tiny tumors
+                [[4, 4], [8, 7], [13, 11]],
+                # P3 - small tumors  
+                [[19, 17], [28, 24], [41, 35]],
+                # P4 - medium tumors
+                [[59, 52], [87, 74], [122, 98]],
+                # P5 - large tumors
+                [[165, 141], [234, 187], [340, 280]]
+            ], dtype=torch.float32).to(self.device)
         else:
-            self.anchors = anchors.to(device)
+            self.anchors = anchors.to(self.device)
         
-        self.nl = len(self.anchors)
-        self.na = self.anchors.shape[1]
+        self.nl = len(self.anchors)  # number of detection layers
+        self.na = self.anchors.shape[1]  # number of anchors per layer
         
-        # Per-level loss balancing
-        self.balance = [4.0, 1.0, 0.25] if self.nl == 3 else [1.0] * self.nl
-        self.autobalance = autobalance
-            
+        # Scale balancing (emphasize high-res layers for small objects)
+        self.balance = [8.0, 4.0, 1.0, 0.4] if self.nl == 4 else [4.0, 1.0, 0.4]
+    
     def forward(self, predictions, targets):
-        """Compute total loss from predictions and targets."""
-        targets_tensor = self.prepare_targets(targets)
-        p = self.prepare_predictions(predictions)
-
-        # Calculate stride for each detection level
-        strides = []
-        for pi in p:
-            _, _, H, W, _ = pi.shape
-            strides.append(self.img_size / max(H, W))
+        """Compute loss."""
+        device = self.device
         
-        # Scale anchors pixel space --> grid space
-        scaled_anchors = [self.anchors[i].to(self.device) / strides[i] for i in range(len(p))]
-
-        if len(p) != self.nl:
-            self.adjust_to_predictions(len(p))
+        # Prepare targets
+        targets_tensor = self._prepare_targets(targets)
         
-        loss = torch.zeros(2, device=self.device)  # [box_loss, obj_loss]
+        # Prepare predictions  
+        p = self._prepare_predictions(predictions)
         
-        has_positive_samples = targets_tensor.shape[0] > 0
+        # Build targets for each layer
+        tbox, indices, anch = self._build_targets(p, targets_tensor)
         
-        if has_positive_samples:
-            tbox, indices, anch = self.build_targets(p, targets_tensor, scaled_anchors)
-        else:
-            tbox = [torch.zeros(0, 4, device=self.device) for _ in range(len(p))]
-            indices = [(torch.zeros(0, dtype=torch.long, device=self.device),) * 4 for _ in range(len(p))]
-            anch = [torch.zeros(0, 2, device=self.device) for _ in range(len(p))]
+        # Loss components
+        lbox = torch.zeros(1, device=device)
+        lobj = torch.zeros(1, device=device)
         
-        # Compute losses for each detection level
+        # Compute loss for each detection layer
         for i, pi in enumerate(p):
-            if i >= len(indices):
-                continue
+            b, a, gj, gi = indices[i]
+            tobj = torch.zeros_like(pi[..., 4])
+            
+            n = len(b)
+            if n:
+                # Get predictions for positive samples
+                ps = pi[b, a, gj, gi]
                 
-            b_size, n_anchors, h, w, n_outputs = pi.shape
-            tobj = torch.zeros((b_size, n_anchors, h, w), dtype=pi.dtype, device=self.device)
-            
-            if has_positive_samples and len(indices[i]) == 4:
-                b, a, gj, gi = indices[i]
+                # Decode box predictions
+                pxy = ps[:, :2].sigmoid() * 2 - 0.5
+                pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anch[i]
+                pbox = torch.cat((pxy, pwh), 1)
                 
-                if b.numel() > 0:
-                    ps = pi[b, a, gj, gi]
-                    
-                    # Decode predictions
-                    pxy = torch.sigmoid(ps[:, 0:2]) * 2.0 - 0.5
-                    pwh = (torch.sigmoid(ps[:, 2:4]) * 2) ** 2 * anch[i]
-                    pbox = torch.cat((pxy, pwh), 1)
-                    
-                    # Compute IoU metrics
-                    iou_ciou = self.bbox_iou(pbox, tbox[i], CIoU=True).squeeze(-1).clamp(0.0, 1.0)
-                    iou_giou = self.bbox_iou(pbox, tbox[i], GIoU=True).squeeze(-1).clamp(-1.0, 1.0)
-                    iou_raw = self.bbox_iou(pbox, tbox[i], CIoU=False).squeeze(-1).clamp(0.0, 1.0)
-
-                    metric = self.hyp.get('reg_metric', 'focal_ciou')
-                    gamma = float(self.hyp.get('focal_gamma', 1.5))
-                    d = float(self.hyp.get('focaler_d', 0.0))
-                    u = float(self.hyp.get('focaler_u', 0.95))
-
-                    # Compute box loss based on selected metric
-                    if metric == 'focal_ciou':
-                        box_loss = (1.0 - iou_ciou).pow(gamma).mean()
-                    elif metric == 'focal_giou':
-                        giou01 = (iou_giou + 1.) / 2.0
-                        box_loss = (1.0 - giou01).pow(gamma).mean()
-                    elif metric == 'giou':
-                        box_loss = (1.0 - ((iou_giou + 1.) / 2.0)).mean()
-                    elif metric == 'focaler_ciou':
-                        iou_focaler = self.focaler_map(iou_raw, d=d, u=u)
-                        base = (1.0 - iou_ciou)
-                        delta = (iou_raw - iou_focaler)
-                        box_loss = (base + delta).mean()
-                    elif metric == 'focaler_giou':
-                        iou_focaler = self.focaler_map(iou_raw, d=d, u=u)
-                        giou01 = (iou_giou + 1.) / 2.0
-                        base = (1.0 - giou01)
-                        delta = (iou_raw - iou_focaler)
-                        box_loss = (base + delta).mean()
-                    else:  # 'ciou'
-                        box_loss = (1.0 - iou_ciou).mean()
-                    
-                    # Set objectness targets
-                    iou_detached = iou_ciou.detach().clamp(0.0, 1.0)
-                    tobj[b, a, gj, gi] = iou_detached.to(tobj.dtype)
-                else:
-                    box_loss = torch.tensor(0.0, device=self.device)
-            else:
-                box_loss = torch.tensor(0.0, device=self.device)
+                # Calculate IoU
+                iou = self._bbox_iou(pbox, tbox[i], CIoU=True).squeeze()
+                
+                # Box loss (Focal-EIoU for small objects)
+                lbox += ((1.0 - iou) ** self.hyp['fl_gamma']).mean() * self.balance[i]
+                
+                # Objectness targets (use IoU as soft label)
+                tobj[b, a, gj, gi] = iou.detach().clamp(0).type(tobj.dtype)
             
-            # Objectness loss
-            obj_loss = self.BCEobj(pi[..., 4], tobj).mean()
+            # Objectness loss with focal weighting
+            obji = self.BCEobj(pi[..., 4], tobj)
             
-            # Apply per-level balancing
-            loss[0] += box_loss * self.balance[min(i, len(self.balance)-1)]
-            loss[1] += obj_loss * self.balance[min(i, len(self.balance)-1)]
+            # Apply positive weight to handle imbalance
+            obji[tobj > 0] *= self.hyp['obj_pw']
             
-            # Auto-balance weights
-            if self.autobalance:
-                objl = float(max(obj_loss.item(), 1e-3))
-                self.balance[i] = float(self.balance[i] * 0.9999 + 0.0001 / objl)
+            # Focal loss modulation
+            p_obj = pi[..., 4].sigmoid()
+            focal_weight = tobj * (1.0 - p_obj) ** 2 + (1.0 - tobj) * p_obj ** 2
+            
+            lobj += (obji * focal_weight).mean() * self.balance[i]
         
-        # Normalize balance weights
-        if self.autobalance and isinstance(self.balance, list) and len(self.balance) > 0:
-            b = torch.tensor(self.balance, device=self.device, dtype=torch.float32)
-            b = (b / b.mean().clamp_(min=1e-6)).clamp_(0.25, 4.0)
-            self.balance = b.detach().cpu().tolist()
-
-        # Apply global loss weights
-        loss[0] *= self.hyp['box']
-        loss[1] *= self.hyp['obj']
+        # Apply loss weights
+        lbox *= self.hyp['box']
+        lobj *= self.hyp['obj']
         
-        # NaN protection
-        for i in range(2):
-            if torch.isnan(loss[i]):
-                loss[i] = torch.tensor(0.1, device=self.device)
-        
-        total_loss = loss.sum()
-        
-        if torch.isnan(total_loss):
-            total_loss = torch.tensor(1.0, device=self.device)
-            loss = torch.tensor([0.2, 0.8], device=self.device)
-        
-        return total_loss, loss.detach()
+        loss = lbox + lobj
+        return loss, torch.cat([lbox.detach(), lobj.detach()])
     
-    def focaler_map(self, iou: torch.Tensor, d: float = 0.0, u: float = 0.95) -> torch.Tensor:
-        """Piecewise-linear remapping for Focaler-IoU (Eq. 14)."""
-        eps = 1e-7
-        d = float(d)
-        u = float(u)
-        
-        if not (0.0 <= d < u <= 1.0):
-            d, u = 0.0, 0.95
-            
-        mapped = (iou - d) / max(u - d, eps)
-        return mapped.clamp_(0.0, 1.0)
-    
-    def bbox_iou(self, box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
-        """Calculate IoU between boxes. Supports standard IoU, GIoU, DIoU, and CIoU."""
-        if xywh:
-            (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
-            w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
-            b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1_, x1 + w1_, y1 - h1_, y1 + h1_
-            b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2_, x2 + w2_, y2 - h2_, y2 + h2_
-        else:
-            b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
-            b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
-            w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
-            w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
-
-        # Intersection
-        inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
-                (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
-
-        # Union
-        union = w1 * h1 + w2 * h2 - inter + eps
-        union = torch.clamp(union, min=eps)
-        
-        # Standard IoU
-        iou = inter / union
-        iou = torch.clamp(iou, min=0.0, max=1.0)
-        
-        # Advanced IoU variants
-        if CIoU or DIoU or GIoU:
-            cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
-            ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
-            
-            if CIoU or DIoU:
-                c2 = cw ** 2 + ch ** 2 + eps
-                c2 = torch.clamp(c2, min=eps)
-                rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 + 
-                        (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / c2
-                
-                if CIoU:
-                    v = (4 / (math.pi ** 2)) * torch.pow(
-                        torch.atan(w2 / (h2 + eps)) - torch.atan(w1 / (h1 + eps)), 2
-                    )
-                    with torch.no_grad():
-                        alpha = v / (v - iou + 1 + eps)
-                    iou = iou - (rho2 + v * alpha)
-                else:  # DIoU
-                    iou = iou - rho2
-            
-            if GIoU:
-                c_area = cw * ch + eps
-                iou = iou - (c_area - union) / c_area
-
-        return iou
-   
-    def prepare_targets(self, targets):
-        """Convert targets to standardized tensor format [N, 5]: (batch_idx, x, y, w, h)."""
+    def _prepare_targets(self, targets):
+        """Convert targets to tensor format."""
         if isinstance(targets, dict):
+            device = self.device
             batch_size = targets['images'].shape[0]
             target_list = []
             
             for i in range(batch_size):
                 bboxes = targets['bboxes'][i]
+                valid = bboxes.sum(dim=1) > 0
                 
-                if torch.isnan(bboxes).any() or torch.isinf(bboxes).any():
-                    continue
-
-                valid_mask = bboxes.sum(dim=1) > 0
-                valid_bboxes = bboxes[valid_mask]
-
-                if len(valid_bboxes) > 0:
-                    # Normalize to [0,1] if in pixel coordinates
-                    if (valid_bboxes.max() > 1.0 + 1e-6):
-                        valid_bboxes = valid_bboxes / float(self.img_size)
-
-                    img_idx = torch.full((len(valid_bboxes), 1), i, 
-                                        dtype=torch.float32, device=self.device)
-
-                    targets_i = torch.cat([img_idx, valid_bboxes], dim=1)
-                    target_list.append(targets_i)
-
-            return torch.cat(target_list, dim=0) if target_list else \
-                   torch.zeros((0, 5), device=self.device)
-
-        return targets
-   
-    def prepare_predictions(self, predictions):
-        """Convert predictions to [B, na, H, W, 5] format (bbox + objectness)."""
-        p = []
-        for i, (bbox_pred, objectness) in enumerate(predictions):
-            # NaN protection
-            if torch.isnan(bbox_pred).any() or torch.isnan(objectness).any():
-                bbox_pred = torch.nan_to_num(bbox_pred, nan=0.0, posinf=10.0, neginf=-10.0)
-                objectness = torch.nan_to_num(objectness, nan=0.0, posinf=1.0, neginf=-1.0)
+                if valid.any():
+                    valid_boxes = bboxes[valid]
+                    # Normalize if needed
+                    if valid_boxes.max() > 1.01:
+                        valid_boxes = valid_boxes / self.img_size
+                    
+                    batch_idx = torch.full((valid.sum(), 1), i, device=device)
+                    target_list.append(torch.cat([batch_idx, valid_boxes], 1))
             
+            return torch.cat(target_list, 0) if target_list else torch.zeros((0, 5), device=device)
+        return targets
+    
+    def _prepare_predictions(self, predictions):
+        """Reshape predictions to [B, na, H, W, 5] format."""
+        p = []
+        for bbox_pred, obj_pred in predictions:
             B, _, H, W = bbox_pred.shape
             
-            # Reshape to [B, na, H, W, C]
-            bbox_pred = bbox_pred.view(B, self.na, 4, H, W).permute(0, 1, 3, 4, 2).contiguous()
-            objectness = objectness.view(B, self.na, 1, H, W).permute(0, 1, 3, 4, 2).contiguous()
+            bbox_pred = bbox_pred.view(B, self.na, 4, H, W).permute(0, 1, 3, 4, 2)
+            obj_pred = obj_pred.view(B, self.na, 1, H, W).permute(0, 1, 3, 4, 2)
             
-            pred = torch.cat([bbox_pred, objectness], dim=-1)
-            p.append(pred)
-        
+            p.append(torch.cat([bbox_pred, obj_pred], -1))
         return p
     
-    def adjust_to_predictions(self, num_predictions):
-        """Adjust balance weights when number of prediction levels changes."""
-        if num_predictions != self.nl:
-            self.nl = num_predictions
-            self.balance = [1.0] * num_predictions
-    
-    def build_targets(self, p, targets, scaled_anchors):
-        """Match ground truth boxes to anchors at each detection level."""
-        na = self.na
+    def _build_targets(self, p, targets):
+        """Match targets to anchors."""
+        device = self.device
         nt = targets.shape[0]
         tbox, indices, anch = [], [], []
-        device = self.device
-
+        
         if nt == 0:
             for i in range(len(p)):
                 tbox.append(torch.zeros(0, 4, device=device))
                 indices.append((torch.zeros(0, dtype=torch.long, device=device),) * 4)
                 anch.append(torch.zeros(0, 2, device=device))
             return tbox, indices, anch
-
-        # Replicate targets for each anchor
-        gain = torch.ones(6, device=device)
-        ai = torch.arange(na, device=device).float().view(na, 1).repeat(1, nt)
-        targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)
-
+        
+        # Get strides for each detection layer
+        strides = []
+        for pi in p:
+            _, _, H, W, _ = pi.shape
+            strides.append(self.img_size / H)
+        
+        # Scale anchors to grid space
+        scaled_anchors = []
         for i in range(len(p)):
-            B, na_l, H, W, _ = p[i].shape
-            anchors = scaled_anchors[i]
-
-            # Scale targets to grid
-            gain[1:5] = torch.tensor([W, H, W, H], device=device)
+            scaled_anchors.append(self.anchors[i] / strides[i])
+        
+        # Prepare targets for all anchors
+        gain = torch.ones(6, device=device)
+        ai = torch.arange(self.na, device=device).float().view(self.na, 1)
+        targets = torch.cat((targets.repeat(self.na, 1, 1), ai[:, :, None]), 2)
+        
+        for i, pi in enumerate(p):
+            anchors = scaled_anchors[i].to(device)
+            gain[1:5] = torch.tensor(pi.shape)[[3, 2, 3, 2]]
+            
+            # Scale targets to grid space
             t = targets * gain
-
-            if t.numel() == 0:
-                tbox.append(torch.zeros(0, 4, device=device))
-                indices.append((torch.zeros(0, dtype=torch.long, device=device),) * 4)
-                anch.append(torch.zeros(0, 2, device=device))
-                continue
-
-            # Anchor matching by aspect ratio
-            r = t[:, :, 3:5] / anchors[:, None]
-            j = torch.max(r, 1. / (r + 1e-9)).max(2)[0] < self.hyp['anchor_t']
-            t = t[j]
-
-            if t.shape[0] == 0:
-                tbox.append(torch.zeros(0, 4, device=device))
-                indices.append((torch.zeros(0, dtype=torch.long, device=device),) * 4)
-                anch.append(torch.zeros(0, 2, device=device))
-                continue
-
-            # Extract components
-            b, gxy, gwh, a = t[:, 0].long(), t[:, 1:3], t[:, 3:5], t[:, 5].long()
             
-            # Grid indices
-            gij = gxy.long()
-            gi = gij[:, 0].clamp_(0, W - 1)
-            gj = gij[:, 1].clamp_(0, H - 1)
-
-            # Target box in grid space
-            tbox_i = torch.cat((gxy - gij.float(), gwh), 1)
-            
-            indices.append((b, a, gj, gi))
-            tbox.append(tbox_i)
-            anch.append(anchors[a])
-
+            if nt:
+                # Match targets to anchors
+                r = t[:, :, 3:5] / anchors[:, None]
+                j = torch.max(r, 1 / r).max(2)[0] < self.hyp['anchor_t']
+                t = t[j]
+                
+                # Extract components
+                b, gxy = t[:, 0].long(), t[:, 1:3]
+                gwh, a = t[:, 3:5], t[:, 5].long()
+                
+                # Grid indices
+                gi, gj = gxy.long().T
+                gi = gi.clamp_(0, gain[3].long() - 1)
+                gj = gj.clamp_(0, gain[2].long() - 1)
+                
+                # Append
+                indices.append((b, a, gj, gi))
+                tbox.append(torch.cat((gxy - gi.float().unsqueeze(1), gwh), 1))
+                anch.append(anchors[a])
+            else:
+                indices.append((torch.zeros(0, dtype=torch.long, device=device),) * 4)
+                tbox.append(torch.zeros(0, 4, device=device))
+                anch.append(torch.zeros(0, 2, device=device))
+        
         return tbox, indices, anch
+    
+    def _bbox_iou(self, box1, box2, xywh=True, CIoU=False):
+        """Calculate IoU with CIoU support."""
+        eps = 1e-7
+        
+        if xywh:
+            # Convert to xyxy
+            b1_x1 = box1[..., 0] - box1[..., 2] / 2
+            b1_y1 = box1[..., 1] - box1[..., 3] / 2
+            b1_x2 = box1[..., 0] + box1[..., 2] / 2
+            b1_y2 = box1[..., 1] + box1[..., 3] / 2
+            
+            b2_x1 = box2[..., 0] - box2[..., 2] / 2
+            b2_y1 = box2[..., 1] - box2[..., 3] / 2
+            b2_x2 = box2[..., 0] + box2[..., 2] / 2
+            b2_y2 = box2[..., 1] + box2[..., 3] / 2
+        else:
+            b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
+            b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
+        
+        # Intersection
+        inter = (b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)).clamp(0) * \
+                (b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)).clamp(0)
+        
+        # Union
+        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+        union = w1 * h1 + w2 * h2 - inter + eps
+        
+        # IoU
+        iou = inter / union
+        
+        if CIoU:
+            # Complete IoU
+            cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)
+            ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)
+            c2 = cw ** 2 + ch ** 2 + eps
+            
+            # Center distance
+            rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 +
+                    (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4
+            
+            # Aspect ratio
+            v = (4 / math.pi ** 2) * (torch.atan(w2 / (h2 + eps)) - torch.atan(w1 / (h1 + eps))).pow(2)
+            with torch.no_grad():
+                alpha = v / (1 - iou + v + eps)
+            
+            return iou - (rho2 / c2 + v * alpha)
+        
+        return iou

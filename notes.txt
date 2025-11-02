@@ -27,3 +27,7 @@ python spark_pretrain.py --data_dir ./data --epochs 300 --batch_size 16 --output
 
 After SPARK pretrain run:
 python training_script.py --data_dir ./data --spark_backbone_path ./spark_outputs/best_spark_model.pth --backbone_lr_mult 0.1 --img_size 640 --batch_size 16 --epochs 300 --lr 0.001
+
+
+now running with another layer of anchors (smallest tumors):
+

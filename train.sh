@@ -1,101 +1,107 @@
 #!/bin/bash
-# PK-YOLO Training Pipeline: SparK Pretraining + Full Training
+# Optimized PK-YOLO Training for Small Tumor Detection
+# Output structure:
+#   experiments/
+#     ├─ spark_pretrain/<YYYYmmdd_HHMMSS>/
+#     └─ pkyolo_train/<YYYYmmdd_HHMMSS>/
 
 set -euo pipefail
 
-# Data paths
-DATA_DIR="./data"               # deve contenere ./train e (opzionale) ./val
-OUTPUT_DIR="./experiments"
+# ---------------- Configuration ----------------
+DATA_DIR="./data"
+EXPERIMENTS_DIR="./experiments"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-# Image sizes
-IMG_SIZE=640                    # fine-tuning PK-YOLO
-PRETRAIN_IMG=320                # pretraining SparK
+# Folder layout (with nested timestamp folder)
+SPARK_OUTPUT="${EXPERIMENTS_DIR}/spark_pretrain/${TIMESTAMP}"
+TRAIN_OUTPUT="${EXPERIMENTS_DIR}/pkyolo_train/${TIMESTAMP}"
 
-# CPU workers
+# Training parameters optimized for small tumors
+SPARK_EPOCHS=100
+SPARK_BATCH_SIZE=32
+SPARK_LR=0.001
+PRETRAIN_IMG=320
+
+TRAIN_EPOCHS=150
+TRAIN_BATCH_SIZE=16       # Smaller batch for better gradients
+TRAIN_LR=5e-4             # Higher initial LR
+BACKBONE_LR_MULT=0.05     # Lower multiplier for pretrained backbone
+IMG_SIZE=640
 WORKERS=16
 
-# ----------------------------
-# SparK Pretraining Parameters
-# ----------------------------
-SPARK_EPOCHS=300
-SPARK_BATCH_SIZE=16
-SPARK_LR=0.001
-SPARK_PATCH_SIZE=16
-SPARK_MASK_RATIO=0.75           # più alto = più veloce (consigliato per MAE/SparK)
+# ---------------- Prep ----------------
+# Validate data
+if [ ! -d "$DATA_DIR" ]; then
+  echo "ERROR: Data directory not found: $DATA_DIR" >&2
+  exit 1
+fi
+if [ ! -d "$DATA_DIR/train" ]; then
+  echo "ERROR: Training split not found: $DATA_DIR/train" >&2
+  exit 1
+fi
 
-# Early Stopping (attivo solo se esiste $DATA_DIR/val)
-SPARK_PATIENCE=15               # epoche senza miglioramento su val
-SPARK_MIN_DELTA=1e-4            # miglioramento minimo su val per azzerare la pazienza
-
-# ----------------------------
-# PK-YOLO Training Parameters
-# ----------------------------
-TRAIN_EPOCHS=300
-TRAIN_BATCH_SIZE=32
-TRAIN_LR=0.0001
-BACKBONE_LR_MULT=0.1
-
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-SPARK_OUTPUT="${OUTPUT_DIR}/spark_pretrain_${TIMESTAMP}"
-TRAIN_OUTPUT="${OUTPUT_DIR}/pkyolo_train_${TIMESTAMP}"
-
+# Create directories
 mkdir -p "$SPARK_OUTPUT" "$TRAIN_OUTPUT"
 
 echo "========================================================================"
-echo "PK-YOLO Training Pipeline"
+echo "PK-YOLO Training Pipeline (Optimized for Small Tumors)"
 echo "========================================================================"
+echo "Timestamp:             $TIMESTAMP"
 echo "Data directory:        $DATA_DIR"
 echo "SparK output:          $SPARK_OUTPUT"
 echo "Training output:       $TRAIN_OUTPUT"
 echo "========================================================================"
 
-# ==========================
-# Stage 1: SparK Pretraining
-# ==========================
-echo ""
-echo "[Stage 1/2] Starting SparK Pretraining..."
-echo "Parameters:"
-echo "  - Epochs:       $SPARK_EPOCHS  (early stop: $SPARK_PATIENCE / Δ>$SPARK_MIN_DELTA)"
-echo "  - Batch size:   $SPARK_BATCH_SIZE"
-echo "  - LR:           $SPARK_LR"
-echo "  - Mask ratio:   $SPARK_MASK_RATIO"
-echo "  - Patch size:   $SPARK_PATCH_SIZE"
-echo "  - Img size:     $PRETRAIN_IMG"
-echo "  - Workers:      $WORKERS"
-echo ""
+# ---------------- Stage 1: SparK Pretraining (optional) ----------------
+SPARK_WEIGHTS=""
+if [ "${1:-}" = "--with-spark" ] || [ "${1:-}" = "" ]; then
+  echo ""
+  echo "[Stage 1/2] Starting SparK Pretraining..."
+  echo "Parameters:"
+  echo "  - Epochs:       $SPARK_EPOCHS"
+  echo "  - Batch size:   $SPARK_BATCH_SIZE"
+  echo "  - LR:           $SPARK_LR"
+  echo "  - Image size:   $PRETRAIN_IMG"
+  echo ""
 
-python3 spark_pretrain.py \
-  --data-dir "$DATA_DIR" \
-  --split train \
-  --out-dir "$SPARK_OUTPUT" \
-  --epochs "$SPARK_EPOCHS" \
-  --batch-size "$SPARK_BATCH_SIZE" \
-  --lr "$SPARK_LR" \
-  --opt adamw \
-  --patch "$SPARK_PATCH_SIZE" \
-  --mask-ratio "$SPARK_MASK_RATIO" \
-  --workers "$WORKERS" \
-  --img-size "$PRETRAIN_IMG" \
-  --patience "$SPARK_PATIENCE" \
-  --min-delta "$SPARK_MIN_DELTA" \
-  --amp
+  python3 spark_pretrain.py \
+    --data-dir "$DATA_DIR" \
+    --out-dir "$SPARK_OUTPUT" \
+    --epochs "$SPARK_EPOCHS" \
+    --batch-size "$SPARK_BATCH_SIZE" \
+    --lr "$SPARK_LR" \
+    --opt adamw \
+    --patch 16 \
+    --mask-ratio 0.75 \
+    --img-size "$PRETRAIN_IMG" \
+    --patience 15 \
+    --min-delta 1e-4 \
+    --workers "$WORKERS" \
+    --amp
 
-echo ""
-echo "SparK pretraining completed"
+  # Prefer best checkpoint; fallback to latest epoch
+  if [ -f "${SPARK_OUTPUT}/best_spark_model.pth" ]; then
+    SPARK_WEIGHTS="${SPARK_OUTPUT}/best_spark_model.pth"
+  else
+    SPARK_WEIGHTS=$(ls -t "${SPARK_OUTPUT}"/repvit_spark_epoch*.pt 2>/dev/null | head -1 || true)
+    if [ -z "${SPARK_WEIGHTS:-}" ]; then
+      echo "ERROR: No SparK weights produced in ${SPARK_OUTPUT}" >&2
+      exit 1
+    fi
+    echo "WARNING: best_spark_model.pth not found; using latest checkpoint: $SPARK_WEIGHTS"
+  fi
+  echo "Using SparK weights: $SPARK_WEIGHTS"
 
-SPARK_WEIGHTS="${SPARK_OUTPUT}/best_spark_model.pth"
-
-if [ ! -f "$SPARK_WEIGHTS" ]; then
-  echo "ERROR: best_spark_model.pth not found in $SPARK_OUTPUT"
-  echo "Ensure spark_pretrain.py saves best_spark_model.pth (val attiva ⇒ early stopping)."
+elif [ "${1:-}" = "--no-spark" ]; then
+  echo "Skipping SparK pretraining as requested (--no-spark)."
+  SPARK_WEIGHTS=""
+else
+  echo "Usage: $0 [--with-spark|--no-spark]"
+  echo "Default: --with-spark"
   exit 1
 fi
 
-echo "Using pretrained backbone: $SPARK_WEIGHTS"
-
-# ==================================================
-# Stage 2: PK-YOLO Training with Pretrained Backbone
-# ==================================================
+# ---------------- Stage 2: PK-YOLO Training ----------------
 echo ""
 echo "[Stage 2/2] Starting PK-YOLO Training..."
 echo "Parameters:"
@@ -103,34 +109,34 @@ echo "  - Epochs:               $TRAIN_EPOCHS"
 echo "  - Batch size:           $TRAIN_BATCH_SIZE"
 echo "  - LR:                   $TRAIN_LR"
 echo "  - Backbone LR mult:     $BACKBONE_LR_MULT"
-echo "  - Img size:             $IMG_SIZE"
-echo "  - Workers:              $WORKERS"
-echo "  - Pretrained backbone:  $SPARK_WEIGHTS"
+echo "  - Image size:           $IMG_SIZE"
+if [ -n "$SPARK_WEIGHTS" ]; then
+  echo "  - Pretrained backbone:  $SPARK_WEIGHTS"
+fi
 echo ""
 
 python3 training_script.py \
   --data_dir "$DATA_DIR" \
   --output_dir "$TRAIN_OUTPUT" \
-  --batch_size "$TRAIN_BATCH_SIZE" \
   --epochs "$TRAIN_EPOCHS" \
+  --batch_size "$TRAIN_BATCH_SIZE" \
   --lr "$TRAIN_LR" \
+  --backbone_lr_mult "$BACKBONE_LR_MULT" \
   --img_size "$IMG_SIZE" \
   --workers "$WORKERS" \
-  --spark_backbone_path "$SPARK_WEIGHTS" \
-  --backbone_lr_mult "$BACKBONE_LR_MULT" \
-  --mixed_precision
+  --mixed_precision \
+  ${SPARK_WEIGHTS:+--spark_backbone_path "$SPARK_WEIGHTS"}
 
-echo ""
-echo "PK-YOLO training completed"
-
+# ---------------- Footer ----------------
 echo ""
 echo "========================================================================"
 echo "PIPELINE COMPLETED SUCCESSFULLY"
 echo "========================================================================"
 echo "Results:"
-echo "  - SparK backbone:              $SPARK_WEIGHTS"
-echo "  - PK-YOLO checkpoints:         $TRAIN_OUTPUT/checkpoints/"
-echo "  - Best model:                   $TRAIN_OUTPUT/checkpoints/best_model.pth"
-echo "  - Training visualizations:      $TRAIN_OUTPUT/training_visualizations/"
-echo "  - Configuration:                $TRAIN_OUTPUT/config.yaml"
+if [ -n "$SPARK_WEIGHTS" ]; then
+  echo "  - SparK backbone:      $SPARK_WEIGHTS"
+fi
+echo "  - PK-YOLO checkpoint:  $TRAIN_OUTPUT/best_model.pth"
+echo "  - SparK folder:        $SPARK_OUTPUT/"
+echo "  - Training folder:     $TRAIN_OUTPUT/"
 echo "========================================================================"

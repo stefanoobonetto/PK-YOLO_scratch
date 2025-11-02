@@ -1,20 +1,18 @@
 import torch
-import logging
 import torch.nn as nn
-from pathlib import Path
 import torch.nn.functional as F
+from pathlib import Path
+import logging
 
 logger = logging.getLogger(__name__)
 
 
 class DWConv(nn.Module):
-    """Depth-wise convolution layer."""
-    def __init__(self, dim, kernel_size=3, stride=1, padding=1):
+    """Depthwise convolution."""
+    def __init__(self, dim, kernel_size=3, stride=1):
         super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size, stride, padding, groups=dim)
-        nn.init.kaiming_normal_(self.dwconv.weight, mode='fan_out', nonlinearity='relu')
-        if self.dwconv.bias is not None:
-            nn.init.zeros_(self.dwconv.bias)
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size, stride, 
+                                kernel_size//2, groups=dim, bias=False)
 
     def forward(self, x):
         return self.dwconv(x)
@@ -25,369 +23,314 @@ class RepViTBlock(nn.Module):
     def __init__(self, inp, oup, stride=1, expand_ratio=4):
         super().__init__()
         hidden_dim = int(inp * expand_ratio)
-        self.identity = stride == 1 and inp == oup
+        self.use_res = stride == 1 and inp == oup
         
-        self.conv1 = nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False)
-        self.bn1 = nn.BatchNorm2d(hidden_dim)
+        self.conv = nn.Sequential(
+            # Expand
+            nn.Conv2d(inp, hidden_dim, 1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU6(inplace=True),
+            # Depthwise
+            DWConv(hidden_dim, stride=stride),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU6(inplace=True),
+            # SE
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(hidden_dim, hidden_dim // 4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim // 4, hidden_dim, 1),
+            nn.Sigmoid(),
+            # Project
+            nn.Conv2d(hidden_dim, oup, 1, bias=False),
+            nn.BatchNorm2d(oup),
+        )
         
-        self.dwconv = DWConv(hidden_dim, stride=stride)
-        self.bn2 = nn.BatchNorm2d(hidden_dim)
+        # Simplified SE application
+        self.se_idx = 6  # Index where SE starts
+
+    def forward(self, x):
+        identity = x if self.use_res else None
         
-        self.conv2 = nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False)
-        self.bn3 = nn.BatchNorm2d(oup)
+        # Split at SE
+        for i, layer in enumerate(self.conv[:self.se_idx]):
+            x = layer(x)
         
         # SE attention
-        self.se = nn.Sequential(
+        se = x
+        for layer in self.conv[self.se_idx:self.se_idx+4]:
+            se = layer(se)
+        x = x * se
+        
+        # Final projection
+        x = self.conv[-2:](x)
+        
+        if identity is not None:
+            x = x + identity
+        return x
+
+
+class Backbone(nn.Module):
+    """Optimized RepViT backbone for small object detection."""
+    
+    def __init__(self, in_channels=4, width_mult=1.0, spark_path=None):
+        super().__init__()
+        
+        # Adjusted for better small object detection
+        # Reduced downsampling in early stages
+        self.cfgs = [
+            # c, n, s (channels, num_blocks, stride)
+            [32, 2, 1],   # Keep higher resolution early
+            [64, 3, 2],   # P2 feature
+            [128, 3, 2],  # P3 feature  
+            [256, 4, 2],  # P4 feature
+            [512, 2, 2],  # P5 feature
+        ]
+        
+        # Initial stem with less aggressive downsampling
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, 1, 1, bias=False),  # No stride
+            nn.BatchNorm2d(32),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(32, 32, 3, 2, 1, bias=False),  # Single downsample
+            nn.BatchNorm2d(32),
+            nn.ReLU6(inplace=True)
+        )
+        
+        # Build stages
+        in_c = 32
+        self.stages = nn.ModuleList()
+        
+        for cfg in self.cfgs:
+            out_c, n, s = cfg
+            out_c = int(out_c * width_mult)
+            blocks = []
+            
+            for i in range(n):
+                stride = s if i == 0 else 1
+                blocks.append(RepViTBlock(in_c, out_c, stride))
+                in_c = out_c
+            
+            self.stages.append(nn.Sequential(*blocks))
+        
+        # Cross-modal fusion
+        self.channel_attention = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(oup, max(1, oup // 16), 1),
-            nn.ReLU(inplace=False),
-            nn.Conv2d(max(1, oup // 16), oup, 1),
+            nn.Conv2d(in_c, in_c // 8, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_c // 8, in_c, 1),
             nn.Sigmoid()
         )
         
-        self.act = nn.ReLU6(inplace=False)
+        if spark_path and Path(spark_path).exists():
+            self._load_spark_weights(spark_path)
+        
         self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_out')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    def forward(self, x):
-        if self.identity:
-            identity = x
-            
-        out = self.act(self.bn1(self.conv1(x)))
-        out = self.act(self.bn2(self.dwconv(out)))
-        out = self.bn3(self.conv2(out))
-        
-        se_weight = self.se(out)
-        out = out * se_weight
-        
-        if self.identity:
-            out = out + identity
-            
-        return out
-
-
-class ChannelAttentionBlock(nn.Module):
-    """Channel attention for cross-modal fusion."""
-    def __init__(self, channels):
-        super().__init__()
-        
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.ReLU(inplace=False),
-            nn.Conv2d(channels // 4, channels, 1),
-            nn.Sigmoid()
-        )
-        
-        for m in self.fc.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        
-    def forward(self, x):
-        context = self.global_pool(x)
-        attention = self.fc(context)
-        return x * attention
-
-
-class SparKRepViTBackbone(nn.Module):
-    """RepViT backbone compatible with SparK pretrained weights."""
-    
-    def __init__(self, input_channels=4, width_mult=1.0, spark_pretrained_path=None):
-        super().__init__()
-        
-        self.cfgs = [
-            [32, 1, 1],
-            [64, 2, 2],
-            [128, 2, 2],
-            [256, 2, 2],
-            [512, 1, 2],
-        ]
-        
-        input_channel = int(32 * width_mult)
-        
-        self.stem = nn.Sequential(
-            nn.Conv2d(input_channels, input_channel, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(input_channel),
-            nn.ReLU6(inplace=False)
-        )
-        
-        self.stages = nn.ModuleList()
-        
-        for c, n, s in self.cfgs:
-            output_channel = int(c * width_mult)
-            stage_blocks = nn.ModuleList()
-            
-            for i in range(n):
-                stride = s if i == 0 else 1
-                stage_blocks.append(RepViTBlock(input_channel, output_channel, stride))
-                input_channel = output_channel
-            
-            self.stages.append(stage_blocks)
-        
-        self.cross_modal_attention = ChannelAttentionBlock(input_channel)
-        
-        if spark_pretrained_path and Path(spark_pretrained_path).exists():
-            self._load_spark_weights(spark_pretrained_path)
-            logger.info(f"Loaded SparK pretrained weights from {spark_pretrained_path}")
-        
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def _load_spark_weights(self, spark_path):
+    def _load_spark_weights(self, path):
         """Load SparK pretrained weights."""
         try:
-            checkpoint = torch.load(spark_path, map_location='cpu')
-            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            ckpt = torch.load(path, map_location='cpu')
+            state = ckpt.get('backbone_state_dict', ckpt.get('backbone', ckpt))
             
-            # Extract encoder weights
-            encoder_weights = {}
-            for key, value in state_dict.items():
-                if key.startswith('encoder.'):
-                    new_key = key[8:]
-                    new_key = new_key.replace('.conv.weight', '.weight')
-                    new_key = new_key.replace('.conv.bias', '.bias')
-                    encoder_weights[new_key] = value
+            # Load matching weights only
+            current = self.state_dict()
+            matched = {k: v for k, v in state.items() 
+                      if k in current and current[k].shape == v.shape}
             
-            # Load compatible weights
-            model_dict = self.state_dict()
-            pretrained_dict = {k: v for k, v in encoder_weights.items() 
-                             if k in model_dict and model_dict[k].shape == v.shape}
-            
-            model_dict.update(pretrained_dict)
-            self.load_state_dict(model_dict)
-            
-            logger.info(f"Loaded {len(pretrained_dict)}/{len(encoder_weights)} pretrained weights")
-            
+            current.update(matched)
+            self.load_state_dict(current)
+            logger.info(f"Loaded {len(matched)}/{len(state)} SparK weights")
         except Exception as e:
-            logger.warning(f"Failed to load SparK weights: {e}")
+            logger.warning(f"Failed loading SparK weights: {e}")
 
     def forward(self, x):
         x = self.stem(x)
         
-        feature_maps = []
-        for stage_idx, stage_blocks in enumerate(self.stages):
-            for block in stage_blocks:
-                x = block(x)
-            
-            if stage_idx >= 1:
-                feature_maps.append(x)
+        # Collect multi-scale features (P2, P3, P4, P5)
+        features = []
+        for i, stage in enumerate(self.stages):
+            x = stage(x)
+            if i >= 1:  # Skip first stage, collect P2-P5
+                if i == len(self.stages) - 1:
+                    # Apply channel attention to final feature
+                    att = self.channel_attention(x)
+                    x = x * att
+                features.append(x)
         
-        if len(feature_maps) > 0:
-            feature_maps[-1] = self.cross_modal_attention(feature_maps[-1])
-        
-        return feature_maps
-
-
-class Backbone(nn.Module):
-    """Standard RepViT backbone."""
-    
-    def __init__(self, input_channels=4, width_mult=1.0):
-        super().__init__()
-        
-        self.cfgs = [
-            [32, 1, 1],
-            [64, 2, 2],
-            [128, 2, 2],
-            [256, 2, 2],
-            [512, 1, 2],
-        ]
-        
-        input_channel = int(32 * width_mult)
-        
-        self.stem = nn.Sequential(
-            nn.Conv2d(input_channels, input_channel, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(input_channel),
-            nn.ReLU6(inplace=False)
-        )
-        
-        self.stages = nn.ModuleList()
-        
-        for c, n, s in self.cfgs:
-            output_channel = int(c * width_mult)
-            stage_blocks = nn.ModuleList()
-            
-            for i in range(n):
-                stride = s if i == 0 else 1
-                stage_blocks.append(RepViTBlock(input_channel, output_channel, stride))
-                input_channel = output_channel
-            
-            self.stages.append(stage_blocks)
-        
-        self.cross_modal_attention = ChannelAttentionBlock(input_channel)
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        x = self.stem(x)
-        
-        feature_maps = []
-        for stage_idx, stage_blocks in enumerate(self.stages):
-            for block in stage_blocks:
-                x = block(x)
-            
-            if stage_idx >= 1:
-                feature_maps.append(x)
-        
-        if len(feature_maps) > 0:
-            feature_maps[-1] = self.cross_modal_attention(feature_maps[-1])
-        
-        return feature_maps
+        return features
 
 
 class FPN(nn.Module):
-    """Feature Pyramid Network."""
+    """Enhanced FPN for small object detection."""
+    
     def __init__(self, in_channels_list, out_channels=256):
         super().__init__()
-        self.lateral_convs = nn.ModuleList()
-        self.fpn_convs = nn.ModuleList()
         
-        for in_channels in in_channels_list:
-            self.lateral_convs.append(nn.Conv2d(in_channels, out_channels, 1))
-            self.fpn_convs.append(
-                nn.Sequential(
-                    nn.Conv2d(out_channels, out_channels, 3, padding=1),
-                    nn.BatchNorm2d(out_channels),
-                    nn.ReLU(inplace=False)
-                )
-            )
+        # Lateral connections
+        self.laterals = nn.ModuleList([
+            nn.Conv2d(in_c, out_channels, 1) for in_c in in_channels_list
+        ])
         
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # Output convolutions with deformable-like attention
+        self.outputs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(out_channels, out_channels, 3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+                # Extra refinement for small objects
+                nn.Conv2d(out_channels, out_channels, 3, padding=2, dilation=2),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            ) for _ in in_channels_list
+        ])
+        
+        # Bottom-up path augmentation for small objects
+        self.bu_convs = nn.ModuleList([
+            nn.Conv2d(out_channels, out_channels, 3, 2, 1)
+            for _ in range(len(in_channels_list) - 1)
+        ])
 
     def forward(self, features):
-        laterals = [lateral_conv(feat) for lateral_conv, feat in zip(self.lateral_convs, features)]
+        # Top-down path
+        laterals = [lat(f) for lat, f in zip(self.laterals, features)]
         
+        # Build top-down
         for i in range(len(laterals) - 2, -1, -1):
-            upsampled = F.interpolate(laterals[i + 1], size=laterals[i].shape[-2:], mode='nearest')
-            laterals[i] = laterals[i] + upsampled
+            laterals[i] = laterals[i] + F.interpolate(
+                laterals[i + 1], size=laterals[i].shape[-2:], 
+                mode='bilinear', align_corners=False
+            )
         
-        fpn_outs = [fpn_conv(lateral) for fpn_conv, lateral in zip(self.fpn_convs, laterals)]
+        # Refine outputs
+        outputs = [out(lat) for out, lat in zip(self.outputs, laterals)]
         
-        return fpn_outs
+        # Bottom-up path augmentation (PAN-like)
+        for i in range(len(outputs) - 1):
+            outputs[i + 1] = outputs[i + 1] + self.bu_convs[i](outputs[i])
+        
+        return outputs
 
 
 class YOLOHead(nn.Module):
-    """YOLO detection head for single-class detection."""
+    """YOLO head optimized for small tumors."""
+    
     def __init__(self, in_channels=256, num_anchors=3):
         super().__init__()
-        self.num_anchors = num_anchors
+        mid_channels = max(128, in_channels // 2)
         
-        self.shared_conv = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+        self.detect = nn.Sequential(
+            # Shared convolutions with more capacity
+            nn.Conv2d(in_channels, mid_channels, 3, padding=1),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, in_channels, 3, padding=1),
             nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=False),
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            # Add one more layer for better small object features
+            nn.Conv2d(in_channels, in_channels, 3, padding=2, dilation=2),
             nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=False)
+            nn.ReLU(inplace=True)
         )
         
+        # Separate heads
         self.box_head = nn.Conv2d(in_channels, num_anchors * 4, 1)
         self.obj_head = nn.Conv2d(in_channels, num_anchors, 1)
         
-        self.initialize_head()
-
-    def initialize_head(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, 0, 0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-        
-        nn.init.constant_(self.obj_head.bias, -2.0)
+        # Initialize
+        nn.init.normal_(self.box_head.weight, 0, 0.01)
+        nn.init.normal_(self.obj_head.weight, 0, 0.01)
+        nn.init.constant_(self.obj_head.bias, -4.0)  # Lower initial objectness
 
     def forward(self, x):
-        x = self.shared_conv(x)
-        bbox_pred = self.box_head(x)
-        objectness = self.obj_head(x)
-        return bbox_pred, objectness
+        x = self.detect(x)
+        return self.box_head(x), self.obj_head(x)
 
 
 class MultimodalPKYOLO(nn.Module):
-    """Multimodal PK-YOLO for single-class tumor detection."""
-    def __init__(self, input_channels=4, use_spark_pretrained=False, spark_pretrained_path=None):
+    """Optimized PK-YOLO for small brain tumor detection."""
+    
+    def __init__(self, input_channels=4, num_classes=1, 
+                 use_spark_pretrained=False, spark_pretrained_path=None):
         super().__init__()
         
-        self.input_channels = input_channels
+        self.num_classes = num_classes
         self.use_spark_pretrained = use_spark_pretrained
         
-        if use_spark_pretrained:
-            self.backbone = SparKRepViTBackbone(
-                input_channels=input_channels,
-                spark_pretrained_path=spark_pretrained_path
-            )
-            logger.info("Using SparK pretrained RepViT backbone")
-        else:
-            self.backbone = Backbone(input_channels=input_channels)
-            logger.info("Using standard RepViT backbone")
+        # Backbone
+        self.backbone = Backbone(
+            in_channels=input_channels,
+            spark_path=spark_pretrained_path if use_spark_pretrained else None
+        )
         
+        # Get channel sizes from backbone output
+        # P2=64, P3=128, P4=256, P5=512
         backbone_channels = [64, 128, 256, 512]
         
+        # FPN neck
         self.neck = FPN(backbone_channels, out_channels=256)
-        self.head = YOLOHead(in_channels=256)
         
-        self.anchors = torch.tensor([
-            [[10, 13], [16, 30], [33, 23]],
-            [[30, 61], [62, 45], [59, 119]],
-            [[116, 90], [156, 198], [373, 326]]
-        ], dtype=torch.float32)
+        # Detection heads
+        self.heads = nn.ModuleList([
+            YOLOHead(256, num_anchors=3) for _ in range(4)  # P2-P5
+        ])
+        
+        # OPTIMIZED ANCHORS FOR SMALL TUMORS
+        # Calculated from your dataset statistics
+        self.register_buffer('anchors', torch.tensor([
+            # P2 (8x downsample) - tiny tumors
+            [[4, 4], [8, 7], [13, 11]],
+            # P3 (16x downsample) - small tumors  
+            [[19, 17], [28, 24], [41, 35]],
+            # P4 (32x downsample) - medium tumors
+            [[59, 52], [87, 74], [122, 98]],
+            # P5 (64x downsample) - large tumors
+            [[165, 141], [234, 187], [340, 280]]
+        ], dtype=torch.float32))
 
     def forward(self, x):
+        # Multi-scale features
         features = self.backbone(x)
-        fpn_features = self.neck(features)
-        fpn_features = fpn_features[-3:]  # P3, P4, P5
-
+        
+        # FPN refinement
+        fpn_outs = self.neck(features)
+        
+        # Detection at each scale
         predictions = []
-        for feat in fpn_features:
-            bbox_pred, objectness = self.head(feat)
-            predictions.append((bbox_pred, objectness))
+        for fpn_feat, head in zip(fpn_outs, self.heads):
+            bbox_pred, obj_pred = head(fpn_feat)
+            predictions.append((bbox_pred, obj_pred))
         
         return predictions
 
 
-def create_model(input_channels=4, pretrained_path=None, device='cuda', 
-                use_spark_pretrained=False, spark_pretrained_path=None):
-    """Create MultimodalPKYOLO model with optional SparK pretraining."""
+def create_model(num_classes=1, input_channels=4, pretrained_path=None, 
+                device='cuda', use_spark_pretrained=False, 
+                spark_pretrained_path=None):
+    """Create optimized model."""
+    
     model = MultimodalPKYOLO(
         input_channels=input_channels,
+        num_classes=num_classes,
         use_spark_pretrained=use_spark_pretrained,
         spark_pretrained_path=spark_pretrained_path
     )
     
     if pretrained_path and Path(pretrained_path).exists():
-        checkpoint = torch.load(pretrained_path, map_location=device)
-        
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-            logger.info(f"Loaded full model from {pretrained_path}")
-            if 'epoch' in checkpoint:
-                logger.info(f"Model trained for {checkpoint['epoch']} epochs")
-            if 'best_loss' in checkpoint:
-                logger.info(f"Best loss: {checkpoint['best_loss']}")
+        ckpt = torch.load(pretrained_path, map_location=device)
+        if 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'])
+            logger.info(f"Loaded model from epoch {ckpt.get('epoch', 'unknown')}")
         else:
-            model.load_state_dict(checkpoint)
-            logger.info(f"Loaded model weights from {pretrained_path}")
+            model.load_state_dict(ckpt)
     
     return model.to(device)
