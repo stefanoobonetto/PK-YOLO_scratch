@@ -215,12 +215,8 @@ bin/
 runs/
 runs_best_model/
 
-outputs_old/
-outputs_bad/
-outputs_bad2/
 backups/
-outputs_no_spark/
-outputs_bad_anchors/
 experiments/
 spark_outputs_old/
 
+old_trainings/

@@ -25,7 +25,7 @@ TRAIN_LR=0.0001
 BACKBONE_LR_MULT=0.1
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-SPARK_OUTPUT="./spark_outputs_old/best_spark_model.pth"
+SPARK_WEIGHTS="experiments/spark_pretrain_20251012_182829/best_spark_model.pth"
 TRAIN_OUTPUT="${OUTPUT_DIR}/pkyolo_train_${TIMESTAMP}"
 
 mkdir -p "$TRAIN_OUTPUT"
@@ -34,13 +34,9 @@ echo "========================================================================"
 echo "PK-YOLO Training Pipeline"
 echo "========================================================================"
 echo "Data directory: $DATA_DIR"
-echo "SparK output: $SPARK_OUTPUT"
+echo "SparK output: $SPARK_WEIGHTS"
 echo "Training output: $TRAIN_OUTPUT"
 echo "========================================================================"
-
-
-SPARK_WEIGHTS=$SPARK_OUTPUT
-
 
 echo "Using pretrained backbone: $SPARK_WEIGHTS"
 

@@ -65,13 +65,13 @@ class Trainer:
         (self.output_dir / 'checkpoints').mkdir(parents=True, exist_ok=True)
         
         # Early stopping
-        if self.config.get('training.early_stopping', True):
-            self.early_stopping = EarlyStopping(
-                patience=self.config.get('training.patience', 20),
-                min_delta=self.config.get('training.min_delta', 0.001)
-            )
-        else:
-            self.early_stopping = None
+        # if self.config.get('training.early_stopping', True):
+        #     self.early_stopping = EarlyStopping(
+        #         patience=self.config.get('training.patience', 20),
+        #         min_delta=self.config.get('training.min_delta', 0.001)
+        #     )
+        # else:
+        self.early_stopping = None
         
         # Mixed precision
         self.scaler = None
@@ -449,8 +449,6 @@ def main():
     effective_out_dir = getattr(args, 'output_dir', None) or config.get('logging.output_dir', 'outputs')
     logger.info(f"Effective output dir (used by Visualizer & checkpoints): {effective_out_dir}")
      
-
-
     logger.info("=" * 60)
     logger.info("Multimodal PK-YOLO Training")
     logger.info("=" * 60)
