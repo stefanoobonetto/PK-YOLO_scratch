@@ -1,82 +1,79 @@
 #!/bin/bash
-# PK-YOLO Training Pipeline: SparK Pretraining + Full Training
+# PK-YOLO training only (uses a fixed SparK backbone)
 
-set -e 
+set -euo pipefail
 
-# Data paths
+# ---------------- Configuration ----------------
 DATA_DIR="./data"
-OUTPUT_DIR="./experiments"
-
-# Parameters (PK-YOLO paper Section 4.2)
-IMG_SIZE=640
-WORKERS=4
-
-# SparK Pretraining Parameters 
-SPARK_EPOCHS=300
-SPARK_BATCH_SIZE=16
-SPARK_LR=0.001
-SPARK_MASK_RATIO=0.6
-SPARK_PATCH_SIZE=16
-
-# PK-YOLO Training Parameters (PK-YOLO paper Section 4.2)
-TRAIN_EPOCHS=300
-TRAIN_BATCH_SIZE=32
-TRAIN_LR=0.0001
-BACKBONE_LR_MULT=0.1
-
+EXPERIMENTS_DIR="./experiments"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-SPARK_WEIGHTS="experiments/spark_pretrain_20251012_182829/best_spark_model.pth"
-TRAIN_OUTPUT="${OUTPUT_DIR}/pkyolo_train_${TIMESTAMP}"
+
+TRAIN_OUTPUT="${EXPERIMENTS_DIR}/pkyolo_train/${TIMESTAMP}"
+
+# Training parameters (same as train.sh)
+TRAIN_EPOCHS=150
+TRAIN_BATCH_SIZE=16
+TRAIN_LR=2e-4
+BACKBONE_LR_MULT=0.05
+IMG_SIZE=640
+WORKERS=16
+
+# SparK backbone (fixed as requested)
+BACKBONE_PATH="experiments/spark_pretrain/20251102_195636/best_spark_model.pth"
+
+# ---------------- Prep ----------------
+if [ ! -d "$DATA_DIR" ]; then
+  echo "ERROR: Data directory not found: $DATA_DIR" >&2
+  exit 1
+fi
+if [ ! -d "$DATA_DIR/train" ]; then
+  echo "ERROR: Training split not found: $DATA_DIR/train" >&2
+  exit 1
+fi
+if [ ! -f "$BACKBONE_PATH" ]; then
+  echo "ERROR: Backbone weights not found: $BACKBONE_PATH" >&2
+  exit 1
+fi
 
 mkdir -p "$TRAIN_OUTPUT"
 
 echo "========================================================================"
-echo "PK-YOLO Training Pipeline"
+echo "PK-YOLO Training (ONLY) — Optimized for Small Tumors"
 echo "========================================================================"
-echo "Data directory: $DATA_DIR"
-echo "SparK output: $SPARK_WEIGHTS"
-echo "Training output: $TRAIN_OUTPUT"
-echo "========================================================================"
-
-echo "Using pretrained backbone: $SPARK_WEIGHTS"
-
-# ==================================================
-# Stage 2: PK-YOLO Training with Pretrained Backbone
-# ==================================================
-
-echo ""
-echo "[Stage 2/2] Starting PK-YOLO Training..."
+echo "Timestamp:             $TIMESTAMP"
+echo "Data directory:        $DATA_DIR"
+echo "Training output:       $TRAIN_OUTPUT"
+echo "Backbone weights:      $BACKBONE_PATH"
+echo "------------------------------------------------------------------------"
 echo "Parameters:"
-echo "  - Epochs: $TRAIN_EPOCHS"
-echo "  - Batch size: $TRAIN_BATCH_SIZE"
-echo "  - Learning rate: $TRAIN_LR"
-echo "  - Backbone LR multiplier: $BACKBONE_LR_MULT"
-echo "  - Using pretrained backbone: $SPARK_WEIGHTS"
+echo "  - Epochs:               $TRAIN_EPOCHS"
+echo "  - Batch size:           $TRAIN_BATCH_SIZE"
+echo "  - LR:                   $TRAIN_LR"
+echo "  - Backbone LR mult:     $BACKBONE_LR_MULT"
+echo "  - Image size:           $IMG_SIZE"
+echo "  - Workers:              $WORKERS"
+echo "========================================================================"
 echo ""
 
 python3 training_script.py \
-    --data_dir "$DATA_DIR" \
-    --output_dir "$TRAIN_OUTPUT" \
-    --batch_size $TRAIN_BATCH_SIZE \
-    --epochs $TRAIN_EPOCHS \
-    --lr $TRAIN_LR \
-    --img_size $IMG_SIZE \
-    --workers $WORKERS \
-    --spark_backbone_path "$SPARK_WEIGHTS" \
-    --backbone_lr_mult $BACKBONE_LR_MULT \
-    --mixed_precision
-
-echo ""
-echo "PK-YOLO training completed"
-
+  --data_dir "$DATA_DIR" \
+  --output_dir "$TRAIN_OUTPUT" \
+  --epochs "$TRAIN_EPOCHS" \
+  --batch_size "$TRAIN_BATCH_SIZE" \
+  --lr "$TRAIN_LR" \
+  --backbone_lr_mult "$BACKBONE_LR_MULT" \
+  --img_size "$IMG_SIZE" \
+  --workers "$WORKERS" \
+  --mixed_precision \
+  --spark_backbone_path "$BACKBONE_PATH" \
+  --save_visuals --vis_interval 200 --vis_conf 0.5 \
+#   --mixed_precision \
 echo ""
 echo "========================================================================"
-echo "PIPELINE COMPLETED SUCCESSFULLY"
+echo "PK-YOLO TRAINING COMPLETED"
 echo "========================================================================"
 echo "Results:"
-echo "  - SparK backbone: $SPARK_WEIGHTS"
-echo "  - PK-YOLO checkpoints: $TRAIN_OUTPUT/checkpoints/"
-echo "  - Best model: $TRAIN_OUTPUT/checkpoints/best_model.pth"
-echo "  - Training visualizations: $TRAIN_OUTPUT/training_visualizations/"
-echo "  - Configuration: $TRAIN_OUTPUT/config.yaml"
+echo "  - PK-YOLO checkpoint:  $TRAIN_OUTPUT/best_model.pth"
+echo "  - Training folder:     $TRAIN_OUTPUT/"
+echo "  - Backbone used:       $BACKBONE_PATH"
 echo "========================================================================"

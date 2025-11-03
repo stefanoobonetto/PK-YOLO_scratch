@@ -125,6 +125,7 @@ python3 training_script.py \
   --img_size "$IMG_SIZE" \
   --workers "$WORKERS" \
   --mixed_precision \
+  --save_visuals --vis_interval 200 --vis_conf 0.5
   ${SPARK_WEIGHTS:+--spark_backbone_path "$SPARK_WEIGHTS"}
 
 # ---------------- Footer ----------------
