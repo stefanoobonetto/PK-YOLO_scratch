@@ -229,7 +229,7 @@ def train(args, cfg):
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
     best_metric = float("inf")
     epochs_no_improve = 0
 
@@ -245,16 +245,36 @@ def train(args, cfg):
             with amp_ctx:
                 recon = model(imgs, mask)
                 loss = masked_mse(recon, imgs, mask)
+                if not torch.isfinite(loss):
+                    print(f"[WARN] Non-finite loss at epoch {epoch+1}, step {pbar.n}: {loss.item()}")
+                    optim.zero_grad(set_to_none=True)
+                    if args.amp:
+                        scaler.update()  
+                    continue
 
             optim.zero_grad(set_to_none=True)
+
             if args.amp:
                 scaler.scale(loss).backward()
+                scaler.unscale_(optim)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-                scaler.step(optim); scaler.update()
+                found_inf = False
+                for p in model.parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        found_inf = True
+                        break
+                if found_inf:
+                    print("[WARN] Non-finite gradients; skipping optimizer.step()")
+                    optim.zero_grad(set_to_none=True)
+                    scaler.update()
+                    continue
+                scaler.step(optim)
+                scaler.update()
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
                 optim.step()
+
 
             running += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.5f}", avg=f"{running / max(1, pbar.n):.5f}")

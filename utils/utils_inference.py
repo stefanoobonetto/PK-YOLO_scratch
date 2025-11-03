@@ -69,85 +69,84 @@ def decode_yolo_predictions(
 ) -> List[List[Dict[str, Any]]]:
     """
     Decode raw head outputs into per-image detections.
-    Args:
-        predictions: list of tuples [(cls_score, bbox_pred, objectness), ...] for 3 scales
-            - cls_score shape: (B, A*C, H, W)
-            - bbox_pred shape: (B, A*4, H, W)
-            - objectness shape: (B, A, H, W)
-        anchors: (3,3,2) tensor in pixels for P3,P4,P5 (matching predictions order)
-        img_size: int (assumes square after preprocessing)
-    Returns:
-        detections: list of length B; each is a list of dicts:
-            {'bbox':[cx,cy,w,h] (normalized), 'confidence':float, 'class':int}
+    Supports either per-scale (bbox_pred, objectness) for 1-class models,
+    or (cls_score, bbox_pred, objectness) for multi-class models.
+    Accepts any number of scales; `anchors` must be (nl, na, 2) in pixels.
     """
-    device = predictions[0][0].device
-    B = predictions[0][0].shape[0]
-    all_img_dets = [[] for _ in range(B)]
+    # Basic checks
+    assert isinstance(predictions, (list, tuple)) and len(predictions) > 0, "predictions must be a non-empty list"
+    assert isinstance(anchors, torch.Tensor) and anchors.ndim == 3 and anchors.shape[-1] == 2, \
+        "anchors must be a torch.Tensor of shape (nl, na, 2)"
 
-    for scale_idx, (cls_score, bbox_pred, objectness) in enumerate(predictions):
-        B, ac, h, w = cls_score.shape
-        A = objectness.shape[1]
-        C = ac // A
-        stride = float(img_size) / float(w)
+    first = predictions[0]
+    assert isinstance(first, (list, tuple)), "each per-scale prediction must be a tuple"
+    device = first[0].device  # works for both 2- and 3-tuple formats
+    B = first[0].shape[0]
+    nl = len(predictions)
+    assert anchors.shape[0] == nl, f"anchors nl={anchors.shape[0]} must equal number of scales={nl}"
 
-        # reshape
-        cls_score = cls_score.view(B, A, C, h, w)       # (B,A,C,H,W)
-        bbox_pred = bbox_pred.view(B, A, 4, h, w)       # (B,A,4,H,W)
-        objectness = objectness                          # (B,A,H,W)
+    all_img_dets: List[list] = [[] for _ in range(B)]
 
-        # probs
-        cls_prob = sigmoid(cls_score)                    # (B,A,C,H,W)
-        obj_prob = sigmoid(objectness).unsqueeze(2)      # (B,A,1,H,W)
+    for scale_idx, scale_pred in enumerate(predictions):
+        if len(scale_pred) == 3:
+            cls_score, bbox_pred, objectness = scale_pred
+            Bc, ac, h, w = cls_score.shape
+            assert Bc == B, "batch size mismatch"
+            A = objectness.shape[1]
+            C = ac // A
+            stride = float(img_size) / float(w)
+            cls_score = cls_score.view(B, A, C, h, w)
+            bbox_pred = bbox_pred.view(B, A, 4, h, w)
+            objectness = objectness.view(B, A, h, w)
+            cls_prob = sigmoid(cls_score)               # (B,A,C,H,W)
+            obj_prob = sigmoid(objectness).unsqueeze(2) # (B,A,1,H,W)
+            conf, cls_idx = (cls_prob * obj_prob).max(dim=2)  # (B,A,H,W), (B,A,H,W)
+        elif len(scale_pred) == 2:
+            bbox_pred, objectness = scale_pred
+            Bb, chb, h, w = bbox_pred.shape
+            Bo, A, ho, wo = objectness.shape
+            assert Bb == Bo == B and h == ho and w == wo, "shape mismatch between bbox and objectness"
+            stride = float(img_size) / float(w)
+            bbox_pred = bbox_pred.view(B, A, 4, h, w)
+            objectness = objectness.view(B, A, h, w)
+            conf = sigmoid(objectness)                  # (B,A,H,W)
+            cls_idx = torch.zeros_like(objectness, dtype=torch.long)  # single class
+        else:
+            raise ValueError(f"Expected per-scale tuple of length 2 or 3, got {len(scale_pred)}")
 
-        # If multi-class, take best class; for single-class this is trivial
-        conf, cls_idx = (cls_prob * obj_prob).max(dim=2)  # (B,A,H,W), (B,A,H,W)
-
-        # grid and anchors
-        grid = build_grid(h, w, device)                 # (H,W,2)
-        # scale anchors for this level (normalize to stride)
+        grid = build_grid(h, w, device)  # (H,W,2)
         scale_anchors = (anchors[scale_idx].to(device).float() / stride)  # (A,2)
 
-        # decode xywh
-        xy = sigmoid(bbox_pred[:, :, 0:2, ...]).permute(0,1,3,4,2) * 2.0 - 0.5  # (B,A,H,W,2)
-        wh = sigmoid(bbox_pred[:, :, 2:4, ...]).permute(0,1,3,4,2)
-        wh = (wh * 2.0)**2 * scale_anchors[None, :, None, None, :]             # (B,A,H,W,2)
+        xy = sigmoid(bbox_pred[:, :, 0:2, ...]).permute(0, 1, 3, 4, 2) * 2.0 - 0.5
+        wh = sigmoid(bbox_pred[:, :, 2:4, ...]).permute(0, 1, 3, 4, 2)
+        wh = (wh * 2.0) ** 2 * scale_anchors[None, :, None, None, :]  # (B,A,H,W,2)
 
-        # centers in pixels (normalize later)
-        cx = (xy[..., 0] + grid[..., 0]) * stride        # (B,A,H,W)
-        cy = (xy[..., 1] + grid[..., 1]) * stride        # (B,A,H,W)
+        cx = (xy[..., 0] + grid[..., 0]) * stride
+        cy = (xy[..., 1] + grid[..., 1]) * stride
         ww = wh[..., 0] * stride
         hh = wh[..., 1] * stride
 
-        # filter
-        mask = (conf > conf_thresh) & (ww > 1.0) & (hh > 1.0)  # pixel size threshold 1
+        # filter tiny/low-conf boxes (pixel space)
+        mask = (conf > conf_thresh) & (ww > 1.0) & (hh > 1.0)
         if not mask.any():
             continue
 
-        # gather masked boxes per image
         for b in range(B):
-            mb = mask[b]  # (A,H,W)
+            mb = mask[b]
             if not mb.any():
                 continue
-            cx_b = cx[b][mb]; cy_b = cy[b][mb]; ww_b = ww[b][mb]; hh_b = hh[b][mb]
+            cx_b, cy_b, ww_b, hh_b = cx[b][mb], cy[b][mb], ww[b][mb], hh[b][mb]
             scores_b = conf[b][mb]
             cls_b = cls_idx[b][mb]
 
-            x1 = (cx_b - ww_b/2.0)
-            y1 = (cy_b - hh_b/2.0)
-            x2 = (cx_b + ww_b/2.0)
-            y2 = (cy_b + hh_b/2.0)
-
+            x1 = (cx_b - ww_b / 2.0).clamp(0, img_size)
+            y1 = (cy_b - hh_b / 2.0).clamp(0, img_size)
+            x2 = (cx_b + ww_b / 2.0).clamp(0, img_size)
+            y2 = (cy_b + hh_b / 2.0).clamp(0, img_size)
             xyxy_pix = torch.stack([x1, y1, x2, y2], dim=-1)
-            # clamp to image boundaries
-            xyxy_pix[..., 0::2] = xyxy_pix[..., 0::2].clamp(0, img_size)
-            xyxy_pix[..., 1::2] = xyxy_pix[..., 1::2].clamp(0, img_size)
-
-            # NMS per image across all scales collected later
-            # For simplicity accumulate now; we'll NMS across scales after loop.
             all_img_dets[b].append((xyxy_pix, scores_b, cls_b))
 
-    # Concatenate per image across scales and NMS
-    final = []
+    final: List[List[Dict[str, Any]]] = []
     for b in range(B):
         if len(all_img_dets[b]) == 0:
             final.append([])
@@ -155,22 +154,21 @@ def decode_yolo_predictions(
         xyxy = torch.cat([t[0] for t in all_img_dets[b]], dim=0)
         scores = torch.cat([t[1] for t in all_img_dets[b]], dim=0)
         cls_ids = torch.cat([t[2] for t in all_img_dets[b]], dim=0)
-
         keep = nms_xyxy(xyxy, scores, iou_thresh=iou_thresh, max_dets=max_dets)
         dets = []
         for idx in keep:
             x1, y1, x2, y2 = xyxy[idx].tolist()
-            cx = (x1 + x2) / 2.0 / img_size
-            cy = (y1 + y2) / 2.0 / img_size
-            ww = (x2 - x1) / img_size
-            hh = (y2 - y1) / img_size
             dets.append({
-                "bbox": [cx, cy, ww, hh],   # normalized
+                "bbox": [ (x1 + x2) / 2.0 / img_size,
+                          (y1 + y2) / 2.0 / img_size,
+                          (x2 - x1) / img_size,
+                          (y2 - y1) / img_size ],
                 "confidence": float(scores[idx].item()),
                 "class": int(cls_ids[idx].item())
             })
         final.append(dets)
     return final
+
 
 def save_visualization(
     save_path: Path,
@@ -258,3 +256,4 @@ def parse_args():
     p.add_argument('--json_name', type=str, default='predictions.jsonl')
     p.add_argument('--half', action='store_true', help='Use fp16 (CUDA only)')
     return p.parse_args()
+

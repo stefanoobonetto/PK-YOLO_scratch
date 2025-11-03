@@ -23,24 +23,17 @@ class YOLOLoss(nn.Module):
         # Focal loss for objectness (handles imbalance)
         self.BCEobj = nn.BCEWithLogitsLoss(reduction='none')
         
-        # Optimized anchors for small tumors
-        if anchors is None:
-            self.anchors = torch.tensor([
-                # P2 - tiny tumors
-                [[4, 4], [8, 7], [13, 11]],
-                # P3 - small tumors  
-                [[19, 17], [28, 24], [41, 35]],
-                # P4 - medium tumors
-                [[59, 52], [87, 74], [122, 98]],
-                # P5 - large tumors
-                [[165, 141], [234, 187], [340, 280]]
-            ], dtype=torch.float32).to(self.device)
-        else:
+        # Anchors: prefer the model's buffer to keep a single source of truth
+        if anchors is not None:
             self.anchors = anchors.to(self.device)
-        
-        self.nl = len(self.anchors)  # number of detection layers
-        self.na = self.anchors.shape[1]  # number of anchors per layer
-        
+        elif hasattr(model, "anchors"):
+            self.anchors = model.anchors.detach().to(self.device)
+        else:
+            raise ValueError("Anchors not provided and model has no 'anchors' buffer.")
+
+        self.nl = int(self.anchors.shape[0])  # number of detection scales (e.g., 4 for P2–P5)
+        self.na = int(self.anchors.shape[1])  # number of anchors per scale (3)
+
         # Scale balancing (emphasize high-res layers for small objects)
         self.balance = [8.0, 4.0, 1.0, 0.4] if self.nl == 4 else [4.0, 1.0, 0.4]
     

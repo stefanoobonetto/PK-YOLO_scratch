@@ -21,12 +21,6 @@ from utils.utils_inference import (
     decode_yolo_predictions, save_visualization, time_synchronized
 )
 
-DATASET_ANCHORS = torch.tensor([
-    [[16.2, 14.4], [41.1, 33.3], [74.1, 57.6]],
-    [[110.4, 84.0], [146.4, 107.1], [180.3, 132.6]],
-    [[226.0, 129.3], [214.8, 188.8], [278.2, 173.3]],
-], dtype=torch.float32)
-
 # ------------------ Geometry helpers ------------------
 def cxcywh_to_xyxy_norm(b):
     cx, cy, w, h = b
@@ -272,11 +266,14 @@ def inference():
             preds = model(images)
             infer_time = time_synchronized() - t1
 
-            # anchors from model
-            # decode at low threshold (captures all preds for sweep)
-            dets_batch = decode_yolo_predictions(preds, anchors=DATASET_ANCHORS, img_size=args.img_size,
-                                                 conf_thresh=min_thr_for_decode, iou_thresh=args.nms_iou,
-                                                 max_dets=args.max_dets, num_classes=model.num_classes)
+            # Anchors from model (match number of scales)
+            model_anchors = getattr(model, "anchors", None)
+            if model_anchors is None:
+                raise RuntimeError("Model has no 'anchors' buffer; cannot decode predictions safely.")
+            # Decode at low threshold (captures all preds for sweep)
+            dets_batch = decode_yolo_predictions(preds, anchors=model_anchors, img_size=args.img_size,
+                                                  conf_thresh=min_thr_for_decode, iou_thresh=args.nms_iou,
+                                                  max_dets=args.max_dets, num_classes=model.num_classes)
 
             B = images.shape[0]
             for b in range(B):
