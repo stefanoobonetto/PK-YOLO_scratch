@@ -5,6 +5,7 @@ from pathlib import Path
 from tqdm import tqdm
 import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 
 # Minimal environment setup
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -57,9 +58,12 @@ class Trainer:
         self.optimizer = self._create_optimizer()
 
         # Scheduler
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
-        )
+        warmup = LinearLR(self.optimizer, start_factor=0.1, total_iters=5)
+        cosine = CosineAnnealingLR(self.optimizer, T_max=self.args.epochs - 5, eta_min=self.args.lr * 0.01)
+        self.scheduler = SequentialLR(self.optimizer, schedulers=[warmup, cosine], milestones=[5])
+        
+
+
 
         # Mixed precision — compatible with PyTorch <2.0 and ≥2.0
         if args.mixed_precision:

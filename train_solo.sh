@@ -13,8 +13,8 @@ TRAIN_OUTPUT="${EXPERIMENTS_DIR}/pkyolo_train/${TIMESTAMP}"
 # Training parameters (same as train.sh)
 TRAIN_EPOCHS=150
 TRAIN_BATCH_SIZE=16
-TRAIN_LR=2e-4
-BACKBONE_LR_MULT=0.05
+TRAIN_LR=1e-3
+BACKBONE_LR_MULT=0.3
 IMG_SIZE=640
 WORKERS=16
 
@@ -66,7 +66,7 @@ python3 training_script.py \
   --workers "$WORKERS" \
   --mixed_precision \
   --spark_backbone_path "$BACKBONE_PATH" \
-  --save_visuals --vis_interval 200 --vis_conf 0.5 \
+  --save_visuals --vis_interval 200 --vis_conf 0.1 \
 #   --mixed_precision \
 echo ""
 echo "========================================================================"

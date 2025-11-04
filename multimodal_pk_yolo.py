@@ -123,8 +123,8 @@ class Backbone(nn.Module):
         
         if spark_path and Path(spark_path).exists():
             self._load_spark_weights(spark_path)
-        
-        self._init_weights()
+        else:
+            self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():

@@ -23,7 +23,7 @@ class YOLOLoss(nn.Module):
             "box": 0.10,        # box regression loss weight
             "obj": 1.00,        # objectness loss weight
             "obj_pw": 1.50,     # positive weight for obj BCE
-            "anchor_t": 3.00,   # anchor match threshold (ratio)
+            "anchor_t": 4.00,   # anchor match threshold (ratio)
             "fl_gamma": 1.50,   # focal gamma for obj
         }
 
