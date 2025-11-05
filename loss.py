@@ -38,8 +38,10 @@ class YOLOLoss(nn.Module):
         self.na = int(self.anchors.shape[1])   # anchors per layer
 
         # Per-layer balance (emphasize high-resolution heads)
-        self.balance = [8.0, 4.0, 1.0, 0.4][: self.nl] if self.nl >= 3 else [4.0, 1.0][: self.nl]
-
+        self.balance = [8.0, 4.0, 1.0, 0.4]                 # 20251103_221844
+        self.balance = [4.0, 2.0, 1.0, 1.0]                 # 20251104_184720
+        self.balance = [1.0, 1.0, 1.0, 1.0]                 # 20251104_184720
+        
         # BCE with pos_weight; reduction='none' so we can focal-modulate
         self.register_buffer("_pos_weight", torch.tensor(self.hyp["obj_pw"], device=self.device))
         self.BCEobj = nn.BCEWithLogitsLoss(pos_weight=self._pos_weight, reduction="none")

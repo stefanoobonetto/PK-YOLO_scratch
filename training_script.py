@@ -35,14 +35,6 @@ class Trainer:
         self.output_dir = Path(args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.visualizer = None
-        if getattr(args, 'save_visuals', False):
-            self.visualizer = Visualizer(
-                output_dir=str(self.output_dir),
-                save_interval=getattr(args, 'vis_interval', 200),
-                conf_thresh=getattr(args, 'vis_conf', 0.5),
-            )
-
         # Model
         self.model = create_model(
             input_channels=4,
@@ -50,6 +42,15 @@ class Trainer:
             spark_pretrained_path=args.spark_backbone_path,
             device=self.device.type
         ).to(self.device)
+
+        self.visualizer = None
+        if getattr(args, 'save_visuals', False):
+            self.visualizer = Visualizer(
+                output_dir=str(self.output_dir),
+                save_interval=getattr(args, 'vis_interval', 200),
+                conf_thresh=getattr(args, 'vis_conf', 0.05),
+                anchors=self.model.anchors.detach().cpu().tolist(),  # keep vis and model in sync
+            )
 
         # Loss
         self.criterion = YOLOLoss(self.model, img_size=args.img_size)
