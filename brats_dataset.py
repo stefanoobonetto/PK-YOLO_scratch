@@ -110,7 +110,7 @@ class BraTSDataset(Dataset):
         common_bbox = A.BboxParams(
             format='yolo',
             label_fields=['class_labels'],
-            min_visibility=0.1
+            min_visibility=0.01  # was 0.1
         )
 
         if self.augment:

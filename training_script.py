@@ -167,9 +167,10 @@ class Trainer:
             if lf.exists() and lf.stat().st_size > 0:
                 with open(lf) as f:
                     n = len(f.readlines())
-                    weights.append(3.0 if n > 0 else 1.0)
+                    weights.append(10.0 if n > 0 else 1.0)  # was 3.0
             else:
                 weights.append(1.0)
+
 
         sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 

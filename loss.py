@@ -22,7 +22,7 @@ class YOLOLoss(nn.Module):
         self.hyp = {
             "box": 0.10,        # box regression loss weight
             "obj": 1.00,        # objectness loss weight
-            "obj_pw": 1.50,     # positive weight for obj BCE
+            "obj_pw": 2.0,     # positive weight for obj BCE
             "anchor_t": 4.00,   # anchor match threshold (ratio)
             "fl_gamma": 1.50,   # focal gamma for obj
         }
@@ -38,8 +38,8 @@ class YOLOLoss(nn.Module):
         self.na = int(self.anchors.shape[1])   # anchors per layer
 
         # Per-layer balance (emphasize high-resolution heads)
-        self.balance = [8.0, 4.0, 1.0, 0.4]                 # 20251103_221844
-        self.balance = [4.0, 2.0, 1.0, 1.0]                 # 20251104_184720
+        # self.balance = [8.0, 4.0, 1.0, 0.4]                 # 20251103_221844
+        # self.balance = [4.0, 2.0, 1.0, 1.0]                 # 20251104_184720
         self.balance = [1.0, 1.0, 1.0, 1.0]                 # 20251104_184720
         
         # BCE with pos_weight; reduction='none' so we can focal-modulate
@@ -102,14 +102,26 @@ class YOLOLoss(nn.Module):
 
             # BCE objectness with focal modulation
             obj_logit = pi[..., 4]
-            obj_loss = self.BCEobj(obj_logit, tobj)
+            obj_loss = self.BCEobj(obj_logit, tobj)  # [B, na, H, W]
 
-            # Focal modulation (no extra clamp needed; BCE is stable)
+            # Focal modulation
             p_obj = obj_logit.sigmoid()
             gamma = self.hyp["fl_gamma"]
             focal = tobj * (1.0 - p_obj).pow(gamma) + (1.0 - tobj) * p_obj.pow(gamma)
+            obj_loss = obj_loss * focal
 
-            lobj += (obj_loss * focal).mean() * self.balance[i]
+            # --- NEW: separate normalization for pos/neg, curb negatives ---
+            pos_mask = tobj > 0
+            neg_mask = ~pos_mask
+
+            num_pos = pos_mask.sum().clamp_min(1).float()
+            num_neg = neg_mask.sum().clamp_min(1).float()
+
+            pos_term = obj_loss[pos_mask].sum() / num_pos
+            neg_term = obj_loss[neg_mask].sum() / num_neg
+
+            neg_lambda = 0.25  # try 0.25 (0.25~0.5 are typical)
+            lobj += self.balance[i] * (pos_term + neg_lambda * neg_term)
 
         # Weighted sum
         lbox = lbox * self.hyp["box"]
