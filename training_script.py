@@ -223,6 +223,7 @@ class Trainer:
         # Create datasets
         self.train_dataset = BraTSDataset(
             data_dir, 
+            # split='train_clean', 
             split='train', 
             img_size=img_size,
             augment=self.config.get('augmentation.enabled', True)
@@ -230,6 +231,7 @@ class Trainer:
         
         self.val_dataset = BraTSDataset(
             data_dir, 
+            # split='val_clean', 
             split='val', 
             img_size=img_size, 
             augment=False

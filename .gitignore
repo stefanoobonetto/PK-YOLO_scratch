@@ -220,3 +220,5 @@ experiments/
 spark_outputs_old/
 
 old_trainings/
+data_ok/
+experiments_old/

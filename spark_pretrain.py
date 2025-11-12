@@ -188,7 +188,13 @@ def train(args, cfg):
     data_dir = Path(args.data_dir)
 
     # --- Train loader
-    ds = BraTSDataset(data_dir=data_dir, split='train', img_size=img_size, augment=False)
+    ds = BraTSDataset(
+        data_dir=data_dir,  
+        split='train', 
+        img_size=img_size, 
+        augment=False
+    )
+    
     dl = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -203,9 +209,16 @@ def train(args, cfg):
 
     # --- Val loader (data_dir / 'val')
     dl_val = None
+    # val_root = data_dir / 'val'
     val_root = data_dir / 'val'
     if val_root.exists():
-        ds_val = BraTSDataset(data_dir=data_dir, split='val', img_size=img_size, augment=False)
+        ds_val = BraTSDataset(
+            data_dir=data_dir, 
+            split='val', 
+            img_size=img_size, 
+            augment=False
+        )
+        
         dl_val = DataLoader(
             ds_val,
             batch_size=args.batch_size,

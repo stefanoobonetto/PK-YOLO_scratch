@@ -25,7 +25,7 @@ TRAIN_LR=0.0001
 BACKBONE_LR_MULT=0.1
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-SPARK_WEIGHTS="experiments/spark_pretrain_20251012_182829/best_spark_model.pth"
+SPARK_WEIGHTS="experiments/spark_pretrain_20251110_101007/best_spark_model.pth"
 TRAIN_OUTPUT="${OUTPUT_DIR}/pkyolo_train_${TIMESTAMP}"
 
 mkdir -p "$TRAIN_OUTPUT"

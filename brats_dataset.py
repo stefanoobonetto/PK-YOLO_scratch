@@ -70,6 +70,8 @@ class BraTSDataset(Dataset):
         self.img_size = int(img_size)
         self.augment = bool(augment) and split == 'train'
 
+        # self.image_dir = self.data_dir / split / 'images'
+        # self.label_dir = self.data_dir / split / 'labels'
         self.image_dir = self.data_dir / split / 'images'
         self.label_dir = self.data_dir / split / 'labels'
 
@@ -77,6 +79,9 @@ class BraTSDataset(Dataset):
             raise FileNotFoundError(f"Images directory not found: {self.image_dir}")
         if not self.label_dir.exists():
             raise FileNotFoundError(f"Labels directory not found: {self.label_dir}")
+        
+        print(f'Images directory found: {self.image_dir}')
+        print(f'Labels directory found: {self.label_dir}')
 
         self.slice_ids = self._get_slice_ids()
         self._setup_transforms()
