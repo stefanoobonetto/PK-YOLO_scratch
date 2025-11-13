@@ -6,7 +6,6 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-
 class DWConv(nn.Module):
     """Depth-wise convolution layer."""
     def __init__(self, dim, kernel_size=3, stride=1, padding=1):
@@ -18,7 +17,6 @@ class DWConv(nn.Module):
 
     def forward(self, x):
         return self.dwconv(x)
-
 
 class RepViTBlock(nn.Module):
     """RepViT block with SE attention."""
@@ -71,7 +69,6 @@ class RepViTBlock(nn.Module):
             
         return out
 
-
 class ChannelAttentionBlock(nn.Module):
     """Channel attention for cross-modal fusion."""
     def __init__(self, channels):
@@ -95,7 +92,6 @@ class ChannelAttentionBlock(nn.Module):
         context = self.global_pool(x)
         attention = self.fc(context)
         return x * attention
-
 
 class SparKRepViTBackbone(nn.Module):
     """RepViT backbone compatible with SparK pretrained weights."""

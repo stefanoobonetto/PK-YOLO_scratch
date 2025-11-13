@@ -43,7 +43,7 @@ def create_default_config(args=None):
             'save_interval': 25
         },
         'visualization': {
-            'save_interval': 300,
+            'save_interval': 100,
             'conf_thresh': 0.5
         }
     }

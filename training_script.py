@@ -33,7 +33,6 @@ DATASET_ANCHORS = torch.tensor([
     [[226.0,129.3],[214.8,188.8],[278.2,173.3]]         # P5
 ], dtype=torch.float32)
 
-
 class Trainer:
     def __init__(self, config, run_output_dir=None):
         self.config = config
