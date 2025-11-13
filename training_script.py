@@ -27,6 +27,12 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+DATASET_ANCHORS = torch.tensor([
+    [[16.2,14.4],[41.1,33.3],[74.1,57.6]],              # P3
+    [[110.4,84.0],[146.4,107.1],[180.3,132.6]],         # P4
+    [[226.0,129.3],[214.8,188.8],[278.2,173.3]]         # P5
+], dtype=torch.float32)
+
 
 class Trainer:
     def __init__(self, config, run_output_dir=None):
@@ -39,8 +45,10 @@ class Trainer:
         # Loss 
         self.loss_criterion = YOLOLoss(
             model=self.model,
-            autobalance=True
+            autobalance=True, 
+            anchors=DATASET_ANCHORS
         )
+
         self.loss_criterion.hyp.update({
             'reg_metric': 'focaler_ciou',               # PK-YOLO paper loss
             'focaler_d': 0.0,
@@ -65,13 +73,13 @@ class Trainer:
         (self.output_dir / 'checkpoints').mkdir(parents=True, exist_ok=True)
         
         # Early stopping
-        # if self.config.get('training.early_stopping', True):
-        #     self.early_stopping = EarlyStopping(
-        #         patience=self.config.get('training.patience', 20),
-        #         min_delta=self.config.get('training.min_delta', 0.001)
-        #     )
-        # else:
-        self.early_stopping = None
+        if self.config.get('training.early_stopping', True):
+            self.early_stopping = EarlyStopping(
+                patience=self.config.get('training.patience', 20),
+                min_delta=self.config.get('training.min_delta', 0.001)
+            )
+        else:
+            self.early_stopping = None
         
         # Mixed precision
         self.scaler = None
@@ -82,7 +90,8 @@ class Trainer:
         self.visualizer = Visualizer(
             output_dir=str(self.output_dir),
             save_interval=self.config.get('visualization.save_interval', 100),
-            conf_thresh=self.config.get('visualization.conf_thresh', 0.5)
+            conf_thresh=self.config.get('visualization.conf_thresh', 0.5),
+            anchors=DATASET_ANCHORS
         )
         
         self.log_model_info()
@@ -108,7 +117,8 @@ class Trainer:
     def create_model(self):
         """Create and initialize model."""
         model = MultimodalPKYOLO(
-            input_channels=self.config.get('model.input_channels', 4)
+            input_channels=self.config.get('model.input_channels', 4), 
+            anchors=DATASET_ANCHORS
         ).float().to(self.device)
         
         spark_path = self.config.get('model.spark_backbone_path')

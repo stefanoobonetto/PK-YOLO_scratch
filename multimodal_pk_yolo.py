@@ -327,7 +327,7 @@ class YOLOHead(nn.Module):
 
 class MultimodalPKYOLO(nn.Module):
     """Multimodal PK-YOLO for single-class tumor detection."""
-    def __init__(self, input_channels=4, use_spark_pretrained=False, spark_pretrained_path=None):
+    def __init__(self, input_channels=4, anchors=None, use_spark_pretrained=False, spark_pretrained_path=None):
         super().__init__()
         
         self.input_channels = input_channels
@@ -348,11 +348,7 @@ class MultimodalPKYOLO(nn.Module):
         self.neck = FPN(backbone_channels, out_channels=256)
         self.head = YOLOHead(in_channels=256)
         
-        self.anchors = torch.tensor([
-            [[10, 13], [16, 30], [33, 23]],
-            [[30, 61], [62, 45], [59, 119]],
-            [[116, 90], [156, 198], [373, 326]]
-        ], dtype=torch.float32)
+        self.anchors = anchors
 
     def forward(self, x):
         features = self.backbone(x)
